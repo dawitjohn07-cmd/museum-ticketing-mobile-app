@@ -14,5 +14,10 @@ from . import views
 app_name = "payments"
 
 urlpatterns = [
+    path(
+        "bookings/<uuid:booking_id>/verify/",
+        views.PaymentVerificationView.as_view(),
+        name="payment-verify",
+    ),
     path("webhooks/chapa/", views.ChapaWebhookView.as_view(), name="chapa-webhook"),
 ]

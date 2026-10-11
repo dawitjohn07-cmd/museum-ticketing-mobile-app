@@ -123,7 +123,12 @@ class BookingListCreateView(generics.GenericAPIView):
         serializer = BookingCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         booking = services.create_booking(
-            visitor=request.user, **serializer.to_service_kwargs()
+            visitor=request.user,
+            **{
+                key: value
+                for key, value in serializer.to_service_kwargs().items()
+                if key != "payment_return_target"
+            },
         )
         # Every booking (individual, FR-BOOK-001, or group, FR-BOOK-003)
         # leaves create_booking as awaiting_payment -- there is no
@@ -133,7 +138,10 @@ class BookingListCreateView(generics.GenericAPIView):
         # itself.
         from apps.payments.services import create_checkout_session
 
-        create_checkout_session(booking=booking)
+        create_checkout_session(
+            booking=booking,
+            return_target=serializer.validated_data["paymentReturnTarget"],
+        )
         return Response(BookingSerializer(booking).data, status=status.HTTP_201_CREATED)
 
 

@@ -406,6 +406,10 @@ FINANCE_BANK_CODE = env("FINANCE_BANK_CODE")
 # overrides both with its actual public hostnames.
 PUBLIC_API_BASE_URL = env("PUBLIC_API_BASE_URL", default="http://localhost:8000")
 PUBLIC_WEB_BASE_URL = env("PUBLIC_WEB_BASE_URL", default="http://localhost:3000")
+# Optional visitor-mobile return destination. When unset, retain the existing
+# website return URL for bookings created by the web application.
+MOBILE_PAYMENT_RETURN_URL = env("MOBILE_PAYMENT_RETURN_URL", default="")
+MOBILE_NATIVE_PAYMENT_RETURN_URL = env("MOBILE_NATIVE_PAYMENT_RETURN_URL", default="")
 
 # --------------------------------------------------------------------------
 # SMS / Email gateways -- SMS is primary for Visitor OTP (FR-ACC-001) and
