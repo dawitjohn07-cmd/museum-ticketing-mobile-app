@@ -7,13 +7,8 @@ from drf_spectacular.utils import extend_schema
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.generics import get_object_or_404
 
-from apps.bookings.models import Booking
-from apps.bookings.serializers import BookingSerializer
-from apps.core.permissions import IsVisitor
 from . import services
-from .models import Payment
 from .serializers import ChapaWebhookSerializer
 
 
@@ -63,35 +58,3 @@ class ChapaWebhookView(APIView):
         # two validated here (Document 04's `additionalProperties: true`).
         services.confirm_payment_from_webhook(payload=request.data)
         return Response(status=status.HTTP_200_OK)
-
-
-class PaymentVerificationView(APIView):
-    """POST /payments/bookings/{booking_id}/verify/.
-
-    Reconciles an existing checkout with Chapa when its webhook was missed.
-    The visitor can only reconcile their own booking; no client-supplied
-    transaction reference or payment status is accepted.
-    """
-
-    permission_classes = [IsVisitor]
-
-    @extend_schema(responses={200: BookingSerializer})
-    def post(self, request, booking_id):
-        booking = get_object_or_404(
-            Booking.objects.filter(visitor=request.user),
-            id=booking_id,
-        )
-        payment = (
-            Payment.objects.filter(
-                booking=booking,
-                status=Payment.Status.INITIATED,
-            )
-            .order_by("-created_at")
-            .first()
-        )
-        if payment is None:
-            return Response(BookingSerializer(booking).data)
-
-        services.verify_transaction_with_chapa(payment=payment)
-        booking.refresh_from_db()
-        return Response(BookingSerializer(booking).data)
