@@ -1,0 +1,749 @@
+========== 1. STAGED BACKEND DIFF ==========
+diff --git a/backend/.env.example b/backend/.env.example
+index 15578a7..01c2249 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -6,11 +6,13 @@ SECRET_KEY=change-me-to-a-random-secret
+ ALLOWED_HOSTS=*
+ 
+ # Matches the `db` service in docker-compose.yml
+ DATABASE_URL=postgres://museum_ticketing:museum_ticketing@db:5432/museum_ticketing
+ 
+-CORS_ALLOWED_ORIGINS=http://localhost:3000
++# Include the Expo web dev server origin when testing the mobile app in a
++# browser. Keep production origins explicit rather than allowing all origins.
++CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:8081,http://localhost:8082,http://localhost:19006
+ 
+ # Matches the `redis` service. DB 0 = celery broker, 1 = category/
+ # availability cache, 2 = rate-limit counters (Design Spec Sec 6.2).
+ REDIS_URL=redis://redis:6379
+ 
+@@ -42,10 +44,16 @@ CHAPA_WEBHOOK_SECRET=
+ # callback_url (webhook) and return_url (post-payment browser redirect).
+ # Defaults below match docker-compose.yml for local dev; a real deployment
+ # overrides both with its actual public hostnames (Doc 08).
+ PUBLIC_API_BASE_URL=http://localhost:8000
+ PUBLIC_WEB_BASE_URL=http://localhost:3000
++# Set this to the Expo web route for browser development, or to the configured
++# Expo app-link base for native builds. Leave empty for the website fallback.
++MOBILE_PAYMENT_RETURN_URL=http://localhost:8081/payment-return
++# For native builds, set this to a Chapa-supported HTTPS bridge or the Expo
++# app scheme if the configured Chapa account accepts custom URI schemes.
++MOBILE_NATIVE_PAYMENT_RETURN_URL=frontend://payment-return
+ 
+ 
+ # SMS is the primary Visitor OTP channel (FR-ACC-001); email is the
+ # magic-link fallback + Staff password-reset channel.
+ SMS_GATEWAY_API_KEY=
+diff --git a/backend/apps/bookings/serializers.py b/backend/apps/bookings/serializers.py
+index d7aed25..239c41a 100644
+--- a/backend/apps/bookings/serializers.py
++++ b/backend/apps/bookings/serializers.py
+@@ -261,10 +261,16 @@ class BookingCreateSerializer(serializers.Serializer):
+     # receipt voucher (see `Booking.group_tin`'s own field comment).
+     # Optional/blank here at the field level for the same reason
+     # groupName is: the real requiredness is bookingType-conditional,
+     # enforced below in `validate`, not a plain `required=True`.
+     groupTin = serializers.CharField(required=False, allow_null=True, allow_blank=True)
++    paymentReturnTarget = serializers.ChoiceField(
++        choices=("website", "mobile_web", "mobile_native"),
++        required=False,
++        default="website",
++        write_only=True,
++    )
+ 
+     def validate(self, attrs):
+         if attrs["bookingType"] == Booking.BookingType.GROUP and not attrs.get("groupName"):
+             raise serializers.ValidationError(
+                 {"groupName": "Required when bookingType is group."}
+@@ -284,10 +290,11 @@ class BookingCreateSerializer(serializers.Serializer):
+             "visit_date": self.validated_data["visitDate"],
+             "booking_type": self.validated_data["bookingType"],
+             "group_name": self.validated_data.get("groupName") or None,
+             "group_contact_phone": self.validated_data.get("groupContactPhone") or None,
+             "group_tin": self.validated_data.get("groupTin") or None,
++            "payment_return_target": self.validated_data["paymentReturnTarget"],
+         }
+ 
+ 
+ class BookingUpdateItemSerializer(serializers.Serializer):
+     """One `{categoryId, quantity}` entry of a `BookingUpdateRequest`'s
+diff --git a/backend/apps/bookings/views.py b/backend/apps/bookings/views.py
+index 8e6519b..53d47fe 100644
+--- a/backend/apps/bookings/views.py
++++ b/backend/apps/bookings/views.py
+@@ -121,21 +121,29 @@ class BookingListCreateView(generics.GenericAPIView):
+     )
+     def post(self, request):
+         serializer = BookingCreateSerializer(data=request.data)
+         serializer.is_valid(raise_exception=True)
+         booking = services.create_booking(
+-            visitor=request.user, **serializer.to_service_kwargs()
++            visitor=request.user,
++            **{
++                key: value
++                for key, value in serializer.to_service_kwargs().items()
++                if key != "payment_return_target"
++            },
+         )
+         # Every booking (individual, FR-BOOK-001, or group, FR-BOOK-003)
+         # leaves create_booking as awaiting_payment -- there is no
+         # approval gate in between. Local import: apps.payments depends
+         # on apps.bookings, not the reverse (Design Spec Sec 3.2) -- this
+         # view layer is what composes both, never bookings/services.py
+         # itself.
+         from apps.payments.services import create_checkout_session
+ 
+-        create_checkout_session(booking=booking)
++        create_checkout_session(
++            booking=booking,
++            return_target=serializer.validated_data["paymentReturnTarget"],
++        )
+         return Response(BookingSerializer(booking).data, status=status.HTTP_201_CREATED)
+ 
+ 
+ class BookingDetailView(generics.RetrieveAPIView):
+     """GET /bookings/{id} -- the owning Visitor or any Staff member.
+diff --git a/backend/apps/payments/services.py b/backend/apps/payments/services.py
+index 3c35a8d..9ca489a 100644
+--- a/backend/apps/payments/services.py
++++ b/backend/apps/payments/services.py
+@@ -26,10 +26,11 @@ Two entry points, matching Document 03 Sec 4.2's sequence diagram:
+ import hashlib
+ import hmac
+ import logging
+ import re
+ import uuid
++from decimal import Decimal, InvalidOperation
+ 
+ import requests
+ from django.conf import settings
+ from django.db import transaction
+ from django.utils import timezone
+@@ -144,11 +145,11 @@ def _build_chapa_description(booking):
+     if last_sep > 0:
+         return truncated[:last_sep].strip()
+     return truncated.strip()
+ 
+ 
+-def _initialize_chapa_checkout(*, tx_ref, booking, amount):
++def _initialize_chapa_checkout(*, tx_ref, booking, amount, return_target="website"):
+     """The one function that actually talks to Chapa -- isolated so
+     services-level tests can monkeypatch this instead of the network
+     (mirrors how `apps.notifications.tasks.send_notification` is mocked
+     at its call site in `apps.accounts`' tests, applied here to an
+     outbound HTTP call instead of a Celery task).
+@@ -171,11 +172,24 @@ def _initialize_chapa_checkout(*, tx_ref, booking, amount):
+         "phone_number": _normalize_chapa_phone(booking.visitor.phone),
+         "tx_ref": tx_ref,
+         "callback_url": (
+             f"{settings.PUBLIC_API_BASE_URL.rstrip('/')}/api/v1/payments/webhooks/chapa/"
+         ),
+-        "return_url": f"{settings.PUBLIC_WEB_BASE_URL.rstrip('/')}/bookings/{booking.id}",
++        "return_url": (
++            f"{(
++                settings.MOBILE_NATIVE_PAYMENT_RETURN_URL
++                if return_target == "mobile_native"
++                else settings.MOBILE_PAYMENT_RETURN_URL
++            ).rstrip('/')}/{booking.id}"
++            if return_target in {"mobile_web", "mobile_native"}
++            and (
++                settings.MOBILE_NATIVE_PAYMENT_RETURN_URL
++                if return_target == "mobile_native"
++                else settings.MOBILE_PAYMENT_RETURN_URL
++            )
++            else f"{settings.PUBLIC_WEB_BASE_URL.rstrip('/')}/bookings/{booking.id}"
++        ),
+         "customization": {
+             "title": "Museum Ticket",
+             "description": _build_chapa_description(booking),
+         },
+     }
+@@ -214,11 +228,11 @@ def _initialize_chapa_checkout(*, tx_ref, booking, amount):
+ 
+     return checkout_url
+ 
+ 
+ @transaction.atomic
+-def create_checkout_session(*, booking, amount=None):
++def create_checkout_session(*, booking, amount=None, return_target="website"):
+     """Implements FR-PAY-001 and Document 04's "response includes a
+     checkout URL" on `POST /bookings` (individual or group alike).
+ 
+     `amount` defaults to `booking.total_amount_etb` -- correct for a
+     booking's first-ever payment, since nothing has been paid yet. The
+@@ -258,11 +272,14 @@ def create_checkout_session(*, booking, amount=None):
+     )
+     if existing is not None and existing.checkout_url:
+         return existing
+ 
+     tx_ref = _generate_tx_ref(booking)
+-    checkout_url = _initialize_chapa_checkout(tx_ref=tx_ref, booking=booking, amount=amount)
++    checkout_args = {"tx_ref": tx_ref, "booking": booking, "amount": amount}
++    if return_target in {"mobile_web", "mobile_native"}:
++        checkout_args["return_target"] = return_target
++    checkout_url = _initialize_chapa_checkout(**checkout_args)
+ 
+     payment = Payment.objects.create(
+         booking=booking,
+         tx_ref=tx_ref,
+         amount_etb=amount,
+@@ -333,17 +350,65 @@ def verify_webhook_signature(*, raw_body: bytes, signature_header) -> bool:
+         hashlib.sha256,
+     ).hexdigest()
+     return hmac.compare_digest(expected, signature_header)
+ 
+ 
++def verify_transaction_with_chapa(*, payment):
++    """Fetch and reconcile one existing transaction from Chapa.
++
++    This is a server-to-server recovery path for a missed webhook. It never
++    creates a checkout session and only applies a provider response after
++    matching the durable transaction reference, amount, and currency.
++    """
++    try:
++        response = requests.get(
++            f"{CHAPA_BASE_URL}/transaction/verify/{payment.tx_ref}",
++            headers={"Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}"},
++            timeout=CHAPA_TIMEOUT_SECONDS,
++        )
++        response.raise_for_status()
++        provider_response = response.json()
++    except (requests.RequestException, ValueError) as exc:
++        logger.exception("Chapa transaction verification failed for payment %s", payment.id)
++        raise PaymentGatewayError() from exc
++
++    provider_data = provider_response.get("data") or {}
++    if provider_response.get("status") != "success":
++        raise PaymentGatewayError()
++    if provider_data.get("tx_ref") != payment.tx_ref:
++        raise ValidationError({"tx_ref": "Chapa returned an unexpected transaction reference."})
++    if str(provider_data.get("currency", "")).upper() != payment.currency.upper():
++        raise ValidationError({"currency": "Chapa returned an unexpected currency."})
++    try:
++        provider_amount = Decimal(str(provider_data.get("amount")))
++    except (InvalidOperation, TypeError):
++        raise ValidationError({"amount": "Chapa returned an invalid transaction amount."})
++    if provider_amount != payment.amount_etb:
++        raise ValidationError({"amount": "Chapa returned an unexpected transaction amount."})
++
++    provider_status = str(provider_data.get("status", "")).lower()
++    if provider_status in _CHAPA_SUCCESS_STATUSES or provider_status in {"failed", "cancelled"}:
++        # The response came directly from Chapa over an authenticated
++        # server-to-server request, so it is trusted like a verified callback.
++        return confirm_payment_from_webhook(
++            payload={
++                **provider_data,
++                "tx_ref": payment.tx_ref,
++                "status": provider_status,
++            },
++            record_webhook=False,
++        )
++    return payment
++
++
+ # --------------------------------------------------------------------------
+ # Webhook-confirmed payment (FR-PAY-002, FR-PAY-004)
+ # --------------------------------------------------------------------------
+ 
+ 
+ @transaction.atomic
+-def confirm_payment_from_webhook(*, payload: dict):
++def confirm_payment_from_webhook(*, payload: dict, record_webhook=True):
+     """Implements FR-PAY-002/FR-PAY-004. The *only* path that confirms a
+     booking (Document 03 Sec 4.2) -- the client-side `return_url` redirect
+     after checkout is never trusted on its own.
+ 
+     Safe to call more than once for the same `tx_ref`: a payment that is
+@@ -361,23 +426,28 @@ def confirm_payment_from_webhook(*, payload: dict):
+         )
+     except Payment.DoesNotExist:
+         raise ValidationError({"tx_ref": "Unknown transaction reference."})
+ 
+     now = timezone.now()
+-    payment.webhook_payload = payload
+-    payment.webhook_received_at = now
++    if record_webhook:
++        payment.webhook_payload = payload
++        payment.webhook_received_at = now
+ 
+     if payment.confirmed_at is not None:
+-        payment.save(update_fields=["webhook_payload", "webhook_received_at", "updated_at"])
++        update_fields = ["updated_at"]
++        if record_webhook:
++            update_fields.extend(["webhook_payload", "webhook_received_at"])
++        payment.save(update_fields=update_fields)
+         return payment
+ 
+     gateway_status = str(payload.get("status", "")).lower()
+     if gateway_status not in _CHAPA_SUCCESS_STATUSES:
+         payment.status = Payment.Status.FAILED
+-        payment.save(
+-            update_fields=["status", "webhook_payload", "webhook_received_at", "updated_at"]
+-        )
++        update_fields = ["status", "updated_at"]
++        if record_webhook:
++            update_fields.extend(["webhook_payload", "webhook_received_at"])
++        payment.save(update_fields=update_fields)
+         write_audit_log(
+             actor_id=None,
+             action="payment.failed",
+             target_type="payment",
+             target_id=payment.id,
+@@ -385,19 +455,14 @@ def confirm_payment_from_webhook(*, payload: dict):
+         )
+         return payment
+ 
+     payment.status = Payment.Status.COMPLETED
+     payment.confirmed_at = now
+-    payment.save(
+-        update_fields=[
+-            "status",
+-            "confirmed_at",
+-            "webhook_payload",
+-            "webhook_received_at",
+-            "updated_at",
+-        ]
+-    )
++    update_fields = ["status", "confirmed_at", "updated_at"]
++    if record_webhook:
++        update_fields.extend(["webhook_payload", "webhook_received_at"])
++    payment.save(update_fields=update_fields)
+ 
+     booking = payment.booking
+     booking.status = Booking.Status.PENDING
+     # Sec 3.3: "cleared once payment is confirmed" -- the checkout link is
+     # no longer meaningful once the booking is Pending.
+diff --git a/backend/apps/payments/urls.py b/backend/apps/payments/urls.py
+index b0f2356..820bba8 100644
+--- a/backend/apps/payments/urls.py
++++ b/backend/apps/payments/urls.py
+@@ -12,7 +12,12 @@ from django.urls import path
+ from . import views
+ 
+ app_name = "payments"
+ 
+ urlpatterns = [
++    path(
++        "bookings/<uuid:booking_id>/verify/",
++        views.PaymentVerificationView.as_view(),
++        name="payment-verify",
++    ),
+     path("webhooks/chapa/", views.ChapaWebhookView.as_view(), name="chapa-webhook"),
+ ]
+diff --git a/backend/apps/payments/views.py b/backend/apps/payments/views.py
+index 623c67c..e408587 100644
+--- a/backend/apps/payments/views.py
++++ b/backend/apps/payments/views.py
+@@ -5,12 +5,17 @@ response status codes. No business logic here (Design Spec Sec 3.1).
+ 
+ from drf_spectacular.utils import extend_schema
+ from rest_framework import permissions, status
+ from rest_framework.response import Response
+ from rest_framework.views import APIView
++from rest_framework.generics import get_object_or_404
+ 
++from apps.bookings.models import Booking
++from apps.bookings.serializers import BookingSerializer
++from apps.core.permissions import IsVisitor
+ from . import services
++from .models import Payment
+ from .serializers import ChapaWebhookSerializer
+ 
+ 
+ class ChapaWebhookView(APIView):
+     """POST /payments/webhooks/chapa/ -- AllowAny + signature check
+@@ -56,5 +61,37 @@ class ChapaWebhookView(APIView):
+         # The full raw payload (not just validated_data) is what gets
+         # stored/interpreted -- Chapa's payload carries fields beyond the
+         # two validated here (Document 04's `additionalProperties: true`).
+         services.confirm_payment_from_webhook(payload=request.data)
+         return Response(status=status.HTTP_200_OK)
++
++
++class PaymentVerificationView(APIView):
++    """POST /payments/bookings/{booking_id}/verify/.
++
++    Reconciles an existing checkout with Chapa when its webhook was missed.
++    The visitor can only reconcile their own booking; no client-supplied
++    transaction reference or payment status is accepted.
++    """
++
++    permission_classes = [IsVisitor]
++
++    @extend_schema(responses={200: BookingSerializer})
++    def post(self, request, booking_id):
++        booking = get_object_or_404(
++            Booking.objects.filter(visitor=request.user),
++            id=booking_id,
++        )
++        payment = (
++            Payment.objects.filter(
++                booking=booking,
++                status=Payment.Status.INITIATED,
++            )
++            .order_by("-created_at")
++            .first()
++        )
++        if payment is None:
++            return Response(BookingSerializer(booking).data)
++
++        services.verify_transaction_with_chapa(payment=payment)
++        booking.refresh_from_db()
++        return Response(BookingSerializer(booking).data)
+diff --git a/backend/config/settings/base.py b/backend/config/settings/base.py
+index 00faa2b..dcce1d1 100644
+--- a/backend/config/settings/base.py
++++ b/backend/config/settings/base.py
+@@ -404,10 +404,14 @@ FINANCE_BANK_CODE = env("FINANCE_BANK_CODE")
+ # the Visitor's browser after paying -- never trusted on its own, FR-PAY-002).
+ # Defaults match docker-compose.yml's local ports; a real deployment (Doc 08)
+ # overrides both with its actual public hostnames.
+ PUBLIC_API_BASE_URL = env("PUBLIC_API_BASE_URL", default="http://localhost:8000")
+ PUBLIC_WEB_BASE_URL = env("PUBLIC_WEB_BASE_URL", default="http://localhost:3000")
++# Optional visitor-mobile return destination. When unset, retain the existing
++# website return URL for bookings created by the web application.
++MOBILE_PAYMENT_RETURN_URL = env("MOBILE_PAYMENT_RETURN_URL", default="")
++MOBILE_NATIVE_PAYMENT_RETURN_URL = env("MOBILE_NATIVE_PAYMENT_RETURN_URL", default="")
+ 
+ # --------------------------------------------------------------------------
+ # SMS / Email gateways -- SMS is primary for Visitor OTP (FR-ACC-001) and
+ # is the higher-urgency alert (Document 08 Sec 5.2); email is the magic-link
+ # fallback verification path, plus the Staff password-reset channel.
+
+========== 2. CURRENT PAYMENT CONFIRMATION CODE ==========
+341:     secret or header never verifies, even in development -- there is no
+342:     "skip verification" mode.
+343:     """
+344:     if not signature_header or not settings.CHAPA_WEBHOOK_SECRET:
+345:         return False
+346: 
+347:     expected = hmac.new(
+348:         settings.CHAPA_WEBHOOK_SECRET.encode("utf-8"),
+349:         raw_body,
+350:         hashlib.sha256,
+351:     ).hexdigest()
+352:     return hmac.compare_digest(expected, signature_header)
+353: 
+354: 
+355: def verify_transaction_with_chapa(*, payment):
+356:     """Fetch and reconcile one existing transaction from Chapa.
+357: 
+358:     This is a server-to-server recovery path for a missed webhook. It never
+359:     creates a checkout session and only applies a provider response after
+360:     matching the durable transaction reference, amount, and currency.
+361:     """
+362:     try:
+363:         response = requests.get(
+364:             f"{CHAPA_BASE_URL}/transaction/verify/{payment.tx_ref}",
+365:             headers={"Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}"},
+366:             timeout=CHAPA_TIMEOUT_SECONDS,
+367:         )
+368:         response.raise_for_status()
+369:         provider_response = response.json()
+370:     except (requests.RequestException, ValueError) as exc:
+371:         logger.exception("Chapa transaction verification failed for payment %s", payment.id)
+372:         raise PaymentGatewayError() from exc
+373: 
+374:     provider_data = provider_response.get("data") or {}
+375:     if provider_response.get("status") != "success":
+376:         raise PaymentGatewayError()
+377:     if provider_data.get("tx_ref") != payment.tx_ref:
+378:         raise ValidationError({"tx_ref": "Chapa returned an unexpected transaction reference."})
+379:     if str(provider_data.get("currency", "")).upper() != payment.currency.upper():
+380:         raise ValidationError({"currency": "Chapa returned an unexpected currency."})
+381:     try:
+382:         provider_amount = Decimal(str(provider_data.get("amount")))
+383:     except (InvalidOperation, TypeError):
+384:         raise ValidationError({"amount": "Chapa returned an invalid transaction amount."})
+385:     if provider_amount != payment.amount_etb:
+386:         raise ValidationError({"amount": "Chapa returned an unexpected transaction amount."})
+387: 
+388:     provider_status = str(provider_data.get("status", "")).lower()
+389:     if provider_status in _CHAPA_SUCCESS_STATUSES or provider_status in {"failed", "cancelled"}:
+390:         # The response came directly from Chapa over an authenticated
+391:         # server-to-server request, so it is trusted like a verified callback.
+392:         return confirm_payment_from_webhook(
+393:             payload={
+394:                 **provider_data,
+395:                 "tx_ref": payment.tx_ref,
+396:                 "status": provider_status,
+397:             },
+398:             record_webhook=False,
+399:         )
+400:     return payment
+401: 
+402: 
+403: # --------------------------------------------------------------------------
+404: # Webhook-confirmed payment (FR-PAY-002, FR-PAY-004)
+405: # --------------------------------------------------------------------------
+406: 
+407: 
+408: @transaction.atomic
+409: def confirm_payment_from_webhook(*, payload: dict, record_webhook=True):
+410:     """Implements FR-PAY-002/FR-PAY-004. The *only* path that confirms a
+411:     booking (Document 03 Sec 4.2) -- the client-side `return_url` redirect
+412:     after checkout is never trusted on its own.
+413: 
+414:     Safe to call more than once for the same `tx_ref`: a payment that is
+415:     already `confirmed_at` is a no-op that still records the replayed
+416:     webhook body, rather than re-applying the booking transition
+417:     (FR-PAY-004, NFR-IDEMPOTENT-001).
+418:     """
+419:     tx_ref = payload.get("tx_ref")
+420:     if not tx_ref:
+421:         raise ValidationError({"tx_ref": "Required."})
+422: 
+423:     try:
+424:         payment = (
+425:             Payment.objects.select_for_update().select_related("booking").get(tx_ref=tx_ref)
+426:         )
+427:     except Payment.DoesNotExist:
+428:         raise ValidationError({"tx_ref": "Unknown transaction reference."})
+429: 
+430:     now = timezone.now()
+431:     if record_webhook:
+432:         payment.webhook_payload = payload
+433:         payment.webhook_received_at = now
+434: 
+435:     if payment.confirmed_at is not None:
+436:         update_fields = ["updated_at"]
+437:         if record_webhook:
+438:             update_fields.extend(["webhook_payload", "webhook_received_at"])
+439:         payment.save(update_fields=update_fields)
+440:         return payment
+441: 
+442:     gateway_status = str(payload.get("status", "")).lower()
+443:     if gateway_status not in _CHAPA_SUCCESS_STATUSES:
+444:         payment.status = Payment.Status.FAILED
+445:         update_fields = ["status", "updated_at"]
+446:         if record_webhook:
+447:             update_fields.extend(["webhook_payload", "webhook_received_at"])
+448:         payment.save(update_fields=update_fields)
+449:         write_audit_log(
+450:             actor_id=None,
+451:             action="payment.failed",
+452:             target_type="payment",
+453:             target_id=payment.id,
+454:             metadata={"tx_ref": tx_ref, "gateway_status": gateway_status},
+455:         )
+456:         return payment
+457: 
+458:     payment.status = Payment.Status.COMPLETED
+459:     payment.confirmed_at = now
+460:     update_fields = ["status", "confirmed_at", "updated_at"]
+461:     if record_webhook:
+462:         update_fields.extend(["webhook_payload", "webhook_received_at"])
+463:     payment.save(update_fields=update_fields)
+464: 
+465:     booking = payment.booking
+466:     booking.status = Booking.Status.PENDING
+467:     # Sec 3.3: "cleared once payment is confirmed" -- the checkout link is
+468:     # no longer meaningful once the booking is Pending.
+469:     booking.chapa_checkout_url = None
+470:     booking.save(update_fields=["status", "chapa_checkout_url", "updated_at"])
+471: 
+472:     write_audit_log(
+473:         actor_id=None,
+474:         action="payment.confirmed",
+475:         target_type="payment",
+476:         target_id=payment.id,
+477:         metadata={"booking_id": str(booking.id), "tx_ref": tx_ref},
+478:     )
+479: 
+480:     # Both off the request path (NFR-PERF-001) -- the webhook handler only
+481:     # enqueues them, never renders/sends synchronously.
+482:     from apps.notifications.tasks import send_notification
+483: 
+484:     from .tasks import render_and_store_receipt
+485: 
+486:     render_and_store_receipt.delay(booking_id=str(booking.id))
+487:     send_notification.delay(
+488:         account_id=str(booking.visitor_id),
+489:         notification_type="booking_payment_confirmed",
+490:         context={"booking_id": str(booking.id), "reference": booking.reference},
+491:     )
+492: 
+493:     return payment
+
+========== 3. GIT STATUS ==========
+M  backend/.env.example
+M  backend/apps/bookings/serializers.py
+M  backend/apps/bookings/views.py
+M  backend/apps/payments/services.py
+M  backend/apps/payments/tests/test_services.py
+M  backend/apps/payments/urls.py
+M  backend/apps/payments/views.py
+M  backend/config/settings/base.py
+ M backend/scripts/export_contract.sh
+ M docker-compose.yml
+ D frontend/.dockerignore
+ M frontend/.env.example
+ D frontend/Dockerfile
+ M frontend/README.md
+ D frontend/eslint.config.mjs
+ D frontend/next-env.d.ts
+ D frontend/next.config.ts
+ M frontend/package-lock.json
+ M frontend/package.json
+ D frontend/postcss.config.mjs
+ D frontend/public/aau-logo.png
+ D frontend/public/fonts/inter/OFL.txt
+ D frontend/public/fonts/inter/inter-latin-wght-normal.woff2
+ D frontend/public/fonts/noto-sans-ethiopic/OFL.txt
+ D frontend/public/fonts/noto-sans-ethiopic/noto-sans-ethiopic-ethiopic-wght-normal.woff2
+ D frontend/public/fonts/noto-sans-ethiopic/noto-sans-ethiopic-latin-wght-normal.woff2
+ D frontend/public/fonts/noto-serif-ethiopic/OFL.txt
+ D frontend/public/fonts/noto-serif-ethiopic/noto-serif-ethiopic-ethiopic-wght-normal.woff2
+ D frontend/public/fonts/noto-serif-ethiopic/noto-serif-ethiopic-latin-wght-normal.woff2
+ D frontend/public/fonts/noto-serif/OFL.txt
+ D frontend/public/fonts/noto-serif/noto-serif-latin-wght-normal.woff2
+ D frontend/public/gallery/walia-ibex.jpg
+ D frontend/scripts/generate-types.sh
+ D frontend/scripts/sync-contract.sh
+ D frontend/src/app/[lang]/book/confirmation/page.tsx
+ D frontend/src/app/[lang]/book/page.tsx
+ D frontend/src/app/[lang]/bookings/[id]/page.tsx
+ D frontend/src/app/[lang]/bookings/page.tsx
+ D frontend/src/app/[lang]/error.tsx
+ D frontend/src/app/[lang]/group-visits/new/page.tsx
+ D frontend/src/app/[lang]/layout.tsx
+ D frontend/src/app/[lang]/not-found.tsx
+ D frontend/src/app/[lang]/page.tsx
+ D frontend/src/app/[lang]/reset-password/page.tsx
+ D frontend/src/app/[lang]/settings/account/page.tsx
+ D frontend/src/app/[lang]/staff/admin/staff/page.tsx
+ D frontend/src/app/[lang]/staff/attendance/page.tsx
+ D frontend/src/app/[lang]/staff/availability/page.tsx
+ D frontend/src/app/[lang]/staff/categories/page.tsx
+ D frontend/src/app/[lang]/staff/dashboard/page.tsx
+ D frontend/src/app/[lang]/staff/forgot-password/page.tsx
+ D frontend/src/app/[lang]/staff/gate/page.tsx
+ D frontend/src/app/[lang]/staff/layout.tsx
+ D frontend/src/app/[lang]/staff/login/page.tsx
+ D frontend/src/app/[lang]/staff/refunds/page.tsx
+ D frontend/src/app/[lang]/staff/reports/page.tsx
+ D frontend/src/app/[lang]/staff/settlement/page.tsx
+ D frontend/src/app/[lang]/staff/settlement/transfers/[id]/page.tsx
+ D frontend/src/app/[lang]/staff/settlement/transfers/page.tsx
+ D frontend/src/app/[lang]/verify-email/page.tsx
+ D frontend/src/app/[lang]/verify/page.tsx
+ D frontend/src/app/apple-icon.png
+ D frontend/src/app/favicon.ico
+ D frontend/src/app/fonts.css
+ D frontend/src/app/global-error.tsx
+ D frontend/src/app/globals.css
+ D frontend/src/app/icon.png
+ D frontend/src/app/not-found.tsx
+ D frontend/src/app/robots.ts
+ D frontend/src/app/sitemap.ts
+ D frontend/src/components/account/ProfilePage.tsx
+ D frontend/src/components/landing/BookVisitCTA.tsx
+ D frontend/src/components/layout/PageContainer.tsx
+ D frontend/src/components/layout/PublicFooter.tsx
+ D frontend/src/components/layout/PublicHeader.tsx
+ D frontend/src/components/layout/SiteFooter.tsx
+ D frontend/src/components/layout/SiteHeader.tsx
+ D frontend/src/components/layout/StaffSidebar.tsx
+ D frontend/src/components/shared/ProtectedRoute.tsx
+ D frontend/src/components/ui/Backdrop.tsx
+ D frontend/src/components/ui/Button.tsx
+ D frontend/src/components/ui/Card.tsx
+ D frontend/src/components/ui/ConfirmDialog.tsx
+ D frontend/src/components/ui/DigitalTicket.tsx
+ D frontend/src/components/ui/EmptyState.tsx
+ D frontend/src/components/ui/ErrorBanner.tsx
+ D frontend/src/components/ui/LanguageToggle.tsx
+ D frontend/src/components/ui/Modal.tsx
+ D frontend/src/components/ui/PasswordField.tsx
+ D frontend/src/components/ui/QRCodeSVG.tsx
+ D frontend/src/components/ui/QuantityInput.tsx
+ D frontend/src/components/ui/RoleBadge.tsx
+ D frontend/src/components/ui/Select.tsx
+ D frontend/src/components/ui/Skeleton.tsx
+ D frontend/src/components/ui/SpecimenGallery.tsx
+ D frontend/src/components/ui/StatCard.tsx
+ D frontend/src/components/ui/StatusBadge.tsx
+ D frontend/src/components/ui/StepIndicator.tsx
+ D frontend/src/components/ui/Table.tsx
+ D frontend/src/components/ui/TextField.tsx
+ D frontend/src/components/ui/Toast.tsx
+ D frontend/src/features/account/api.ts
+ D frontend/src/features/account/components/StaffLoginForm.tsx
+ D frontend/src/features/account/components/VerifyEmailStatus.tsx
+ D frontend/src/features/account/components/VisitorVerifyForm.tsx
+ D frontend/src/features/account/hooks/useAuth.ts
+ D frontend/src/features/account/schemas.ts
+ D frontend/src/features/admin/api.ts
+ D frontend/src/features/admin/components/ProvisionStaffModal.tsx
+ D frontend/src/features/admin/components/StaffAccountTable.tsx
+ D frontend/src/features/admin/schemas.ts
+ D frontend/src/features/attendance/api.ts
+ D frontend/src/features/availability/api.ts
+ D frontend/src/features/booking/api.ts
+ D frontend/src/features/booking/components/AvailabilityDatePicker.tsx
+ D frontend/src/features/booking/components/BookingDetailCard.tsx
+ D frontend/src/features/booking/components/BookingList.tsx
+ D frontend/src/features/booking/components/BookingSummary.tsx
+ D frontend/src/features/booking/components/CancelRescheduleControls.tsx
+ D frontend/src/features/booking/components/DateCategoryPicker.tsx
+ D frontend/src/features/booking/components/EditAwaitingPaymentBooking.tsx
+ D frontend/src/features/catalog/api.ts
+ D frontend/src/features/catalog/components/CategoryFormModal.tsx
+ D frontend/src/features/catalog/components/CategoryTable.tsx
+ D frontend/src/features/catalog/schemas.ts
+ D frontend/src/features/entrance/api.ts
+ D frontend/src/features/entrance/components/AttendanceEntryForm.tsx
+ D frontend/src/features/entrance/components/CategoryCorrectionPanel.tsx
+ D frontend/src/features/entrance/components/ReferenceLookupField.tsx
+ D frontend/src/features/group-bookings/api.ts
+ D frontend/src/features/group-bookings/components/GroupVisitRequestForm.tsx
+ D frontend/src/features/group-bookings/schemas.ts
+ D frontend/src/features/refunds/api.ts
+ D frontend/src/features/reports/api.ts
+ D frontend/src/features/reports/components/AttendanceTab.tsx
+ D frontend/src/features/reports/components/CategoriesTab.tsx
+ D frontend/src/features/reports/components/OperationsPanel.tsx
+ D frontend/src/features/reports/components/OverviewTab.tsx
+ D frontend/src/features/reports/components/RevenueTab.tsx
+ D frontend/src/features/reports/components/SchoolsTab.tsx
+ D frontend/src/features/reports/components/charts.tsx
+ D frontend/src/features/reports/components/ui.tsx
+ D frontend/src/features/reports/lib.ts
+ D frontend/src/features/reports/useReportData.ts
+ D frontend/src/features/settlement/api.ts
+ D frontend/src/features/settlement/components/PendingSettlementTable.tsx
+ D frontend/src/features/settlement/components/TransferConfirmationCard.tsx
+ M frontend/src/lib/api/client.ts
+ D frontend/src/lib/api/errors.ts
+ D frontend/src/lib/auth/auth-context.tsx
+ D frontend/src/lib/auth/roles.ts
+ D frontend/src/lib/gallery/specimens.ts
+ M frontend/src/lib/i18n/locales/am/common.json
+ M frontend/src/lib/i18n/locales/en/common.json
+ D frontend/src/lib/i18n/useTranslation.ts
+ D frontend/src/lib/site.ts
+ D frontend/src/lib/utils/cn.ts
+ D frontend/src/lib/utils/dates.ts
+ D frontend/src/lib/utils/download.ts
+ D frontend/src/lib/utils/redirect.ts
+ D frontend/src/proxy.ts
+ D frontend/tailwind.config.ts
+ M frontend/tsconfig.json
+?? .expo/
+?? backend-review.txt
+?? frontend/.claude/
+?? frontend/.gitignore
+?? frontend/AGENTS.md
+?? frontend/LICENSE
+?? frontend/app.json
+?? frontend/app/
+?? frontend/assets/
+?? frontend/eslint.config.js
+?? frontend/scripts/reset-project.js
+?? frontend/src/components/LanguageSelector.tsx
+?? frontend/src/hooks/
+?? frontend/src/lib/api/services.ts
+?? frontend/src/lib/i18n/useTranslation.tsx
+?? frontend/src/theme.ts
+?? frontend_web/

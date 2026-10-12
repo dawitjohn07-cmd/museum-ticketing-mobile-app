@@ -1,247 +1,199 @@
-import { ApiError, type ApiErrorPayload } from './errors';
+import * as SecureStore from 'expo-secure-store';
+import { Platform } from 'react-native';
 
-const API_BASE = (
-  typeof window === 'undefined'
-    ? process.env.API_INTERNAL_URL ||
-      process.env.NEXT_PUBLIC_API_URL ||
-      'http://localhost:8000/api/v1'
-    : process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'
-  ).replace(/\/+$/, '');
-
-// In-memory token storage (Option A - safest against XSS). Only the
-// access token lives here now -- it's short-lived (15 minutes,
-// config.settings.base.SIMPLE_JWT) and is what actually authorizes API
-// calls, so it's the one worth keeping out of anything an XSS payload
-// could read.
-//
-// The refresh token is NOT stored here (or anywhere in JS) at all -- the
-// backend sets it as an httpOnly cookie instead (apps.accounts.cookies),
-// scoped to /api/v1/auth/, and every fetch below sends credentials:
-// 'include' so the browser attaches it automatically. That's what makes
-// a silent refresh possible even after a full page navigation away from
-// the app and back -- e.g. Chapa's hosted checkout (return_url) -- which
-// wipes plain in-memory state like this module's own `accessToken`.
-let accessToken: string | null = null;
-
-export function setAccessToken(token: string | null) {
-  accessToken = token;
+export class ApiError extends Error {
+  constructor(public payload: unknown, public status?: number) {
+    super(getApiErrorMessage(payload, status));
+    this.name = 'ApiError';
+  }
 }
 
-export function getAccessToken() {
-  return accessToken;
+function getApiErrorMessage(payload: unknown, status?: number): string {
+  if (typeof payload === 'string' && payload.trim()) return payload;
+  if (!payload || typeof payload !== 'object') {
+    return `The server rejected the request${status ? ` (HTTP ${status})` : ''}.`;
+  }
+
+  const body = payload as {
+    detail?: unknown;
+    message?: unknown;
+    error?: { message?: unknown; fieldErrors?: unknown } | string;
+  };
+  const error = body.error;
+  if (typeof error === 'string' && error.trim()) return error;
+  if (error && typeof error === 'object') {
+    if (typeof error.message === 'string' && error.message.trim()) {
+      return error.message;
+    }
+    if (error.fieldErrors && typeof error.fieldErrors === 'object') {
+      return Object.entries(error.fieldErrors)
+        .map(([field, message]) => `${field}: ${String(message)}`)
+        .join(' ');
+    }
+  }
+  if (typeof body.detail === 'string' && body.detail.trim()) return body.detail;
+  if (typeof body.message === 'string' && body.message.trim()) return body.message;
+
+  return `The server rejected the request${status ? ` (HTTP ${status})` : ''}.`;
 }
 
-export function clearAccessToken() {
-  accessToken = null;
+export function getApiErrorMessageForDisplay(error: unknown): string {
+  if (error instanceof ApiError) return error.message;
+  if (error instanceof ApiTimeoutError) return error.message;
+  if (error instanceof Error) return error.message;
+  return 'Could not complete the request. Please try again.';
 }
 
-export function clearAuthTokens() {
-  accessToken = null;
+export class ApiTimeoutError extends Error {
+  constructor() {
+    super('The request timed out. Check the backend URL and network connection.');
+    this.name = 'ApiTimeoutError';
+  }
 }
 
-// Multiple 401s around the same moment shouldn't each fire their own
-// refresh call -- `inFlightRefresh` collapses concurrent callers onto a
-// single request/promise instead.
+const API_BASE = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+const ACCESS_TOKEN_KEY = 'auth_access_token';
+const REFRESH_TOKEN_KEY = 'auth_refresh_token';
+const REQUEST_TIMEOUT_MS = 10000;
+const canUseNativeSecureStore = Platform.OS !== 'web';
+
+let inMemoryAccessToken: string | null = null;
+export let currentLanguageHeader = 'en';
+
+export function setGlobalLanguage(lang: string) {
+  currentLanguageHeader = lang;
+}
+
+export async function setAuthTokens(access: string, refresh?: string) {
+  inMemoryAccessToken = access;
+  if (!canUseNativeSecureStore) return;
+  await SecureStore.setItemAsync(ACCESS_TOKEN_KEY, access);
+  if (refresh) await SecureStore.setItemAsync(REFRESH_TOKEN_KEY, refresh);
+}
+
+export async function getAccessToken() {
+  if (inMemoryAccessToken) return inMemoryAccessToken;
+  if (!canUseNativeSecureStore) return null;
+  inMemoryAccessToken = await SecureStore.getItemAsync(ACCESS_TOKEN_KEY);
+  return inMemoryAccessToken;
+}
+
+export async function getRefreshToken() {
+  if (!canUseNativeSecureStore) return null;
+  return SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+}
+
+export async function clearAuthTokens() {
+  inMemoryAccessToken = null;
+  if (!canUseNativeSecureStore) return;
+  await SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY);
+  await SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY);
+}
+
 let inFlightRefresh: Promise<string | null> | null = null;
 
-// Attempts a silent refresh using the httpOnly refresh-token cookie.
-// Exported so AuthProvider (lib/auth/auth-context.tsx) can call this on
-// mount -- that's the only way a returning visitor (fresh page load,
-// nothing left in memory) gets `isAuthenticated` back without a full
-// re-login.
 export async function refreshAccessToken(): Promise<string | null> {
   if (inFlightRefresh) return inFlightRefresh;
-
   inFlightRefresh = (async () => {
     try {
-      // No body -- the refresh token travels as the httpOnly cookie, not
-      // as a request field. Response shape is `{ access }` only
-      // (contracts/openapi.yaml's TokenRefreshResponse); the rotated
-      // refresh token comes back as a Set-Cookie the browser stores on
-      // its own, never in this JSON.
-      const response = await fetch(`${API_BASE}/auth/refresh/`, {
+      const refreshToken = await getRefreshToken();
+      if (!refreshToken) return null;
+      const response = await fetchWithTimeout(`${API_BASE}/auth/refresh/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
+        body: JSON.stringify({ refresh: refreshToken }),
       });
       if (!response.ok) {
-        clearAuthTokens();
+        await clearAuthTokens();
         return null;
       }
-      const data: { access: string } = await response.json();
-      accessToken = data.access;
+      const data: { access: string; refresh?: string } = await response.json();
+      await setAuthTokens(data.access, data.refresh ?? refreshToken);
       return data.access;
-    } catch {
-      clearAuthTokens();
-      return null;
     } finally {
       inFlightRefresh = null;
     }
   })();
-
   return inFlightRefresh;
 }
 
-// Django's CommonMiddleware has APPEND_SLASH=True (the default), and
-// every path in contracts/openapi.yaml ends in a trailing slash. A
-// slash-less POST/PUT/PATCH/DELETE gets a 301 redirect back, which fetch
-// (like a browser) follows as a bodyless GET -- silently turning e.g. a
-// login or booking-create into a no-op. Normalizing here means call
-// sites can't get this wrong, instead of relying on every feature file
-// remembering the trailing slash by hand.
-function normalizePath(path: string): string {
+function normalizePath(path: string) {
   const [pathname, search] = path.split('?');
-  const normalizedPathname = pathname.endsWith('/') ? pathname : `${pathname}/`;
-  return search ? `${normalizedPathname}?${search}` : normalizedPathname;
+  const normalized = pathname.endsWith('/') ? pathname : `${pathname}/`;
+  return search ? `${normalized}?${search}` : normalized;
 }
 
-async function request<T>(
-  path: string,
-  options: RequestInit = {},
-  _isRetry = false
-): Promise<T> {
+async function fetchWithTimeout(url: string, options: RequestInit = {}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const externalSignal = options.signal;
+  const abortFromExternalSignal = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener('abort', abortFromExternalSignal, { once: true });
+  }
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted && !externalSignal?.aborted) {
+      throw new ApiTimeoutError();
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    externalSignal?.removeEventListener('abort', abortFromExternalSignal);
+  }
+}
+
+async function request<T>(path: string, options: RequestInit = {}, isRetry = false): Promise<T> {
   const normalizedPath = normalizePath(path);
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string>),
+    'Accept-Language': currentLanguageHeader,
+    ...(options.headers as Record<string, string> | undefined),
   };
-
-  const token = getAccessToken();
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  // Get locale from URL path
-  let locale = 'en';
-  if (typeof window !== 'undefined') {
-    const match = window.location.pathname.match(/^\/(en|am)/);
-    if (match) {
-      locale = match[1];
-    }
-  }
-  headers['Accept-Language'] = locale;
+  const token = await getAccessToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE}${normalizedPath}`, {
+    response = await fetchWithTimeout(`${API_BASE}${normalizedPath}`, {
       ...options,
       headers,
-      // Needed so the browser sends the httpOnly refresh-token cookie on
-      // /auth/refresh/ (and /auth/logout/) -- harmless elsewhere since the
-      // cookie is path-scoped to /api/v1/auth/ (apps.accounts.cookies) and
-      // simply won't be attached to other requests.
       credentials: 'include',
-      cache: 'no-store',
     });
-  } catch {
-    throw new Error(
-      'Network error - could not reach the server. Please check your connection and try again.'
-    );
+  } catch (error) {
+    if (error instanceof ApiTimeoutError) throw error;
+    throw new Error('Network error: could not reach the server. Check the backend URL and connection.');
   }
 
-  // A 401 means the access token is missing, expired, or was never valid
-  // -- try exactly one silent refresh (it can succeed purely off the
-  // httpOnly cookie, even with no token in memory -- e.g. right after a
-  // fresh page load) and retry the original request once. `_isRetry`
-  // stops this from looping if the refreshed token is *also* rejected,
-  // and normalizePath ending in "/auth/refresh/" itself is skipped to
-  // avoid refreshing recursively off of the refresh call's own 401.
-  if (response.status === 401 && !_isRetry && !normalizedPath.startsWith('/auth/refresh')) {
+  if (response.status === 401 && !isRetry && !normalizedPath.startsWith('/auth/refresh')) {
     const newToken = await refreshAccessToken();
-    if (newToken) {
-      return request<T>(path, options, true);
-    }
+    if (newToken) return request<T>(path, options, true);
   }
+  if (response.status === 204) return undefined as T;
 
-  // 204 No Content (e.g. DELETE /categories/{id}/ -- backend's
-  // retire_category returns Response(status=204) with no body) has
-  // nothing for response.json() to parse. Treat it as success with no
-  // payload rather than letting the JSON parse fail and get reported as
-  // a bogus "Invalid response from server" -- the request itself
-  // already succeeded by the time we get here.
-  if (response.status === 204) {
-    if (!response.ok) {
-      throw new ApiError({} as ApiErrorPayload);
-    }
-    return undefined as T;
-  }
-
-  let data;
+  let data: unknown;
   try {
     data = await response.json();
   } catch {
-    throw new Error('Invalid response from server');
+    if (!response.ok) throw new ApiError({ detail: `Request failed with HTTP ${response.status}.` }, response.status);
+    throw new Error('The server returned an invalid response.');
   }
-
-  if (!response.ok) {
-    throw new ApiError(data as ApiErrorPayload);
-  }
-
+  if (!response.ok) throw new ApiError(data, response.status);
   return data as T;
 }
 
-// Fetches a binary file (a receipt PDF, etc.) through the same
-// authenticated API host every other call above uses, and returns it as
-// a Blob rather than parsed JSON.
-//
-// This deliberately does NOT hit a storage-hosted URL (e.g. a
-// `receiptUrl` field from a response) directly -- that host is served
-// by the reverse proxy/object storage in staging and production, not
-// this Django app, so it doesn't carry this app's CORS configuration
-// and can be on a different scheme, both of which silently break a
-// scripted `fetch()` (mixed-content or CORS) even though a plain
-// browser navigation to the same link works fine. Routing through
-// `API_BASE` instead reuses the exact path -- and auth -- every other
-// successful request on this page already goes through.
-async function downloadFile(path: string): Promise<Blob> {
-  const normalizedPath = normalizePath(path);
-  const headers: Record<string, string> = {};
-  const token = getAccessToken();
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  let response = await fetch(`${API_BASE}${normalizedPath}`, {
-    headers,
-    credentials: 'include',
-    cache: 'no-store',
-  });
-
-  if (response.status === 401) {
-    const newToken = await refreshAccessToken();
-    if (newToken) {
-      response = await fetch(`${API_BASE}${normalizedPath}`, {
-        headers: { Authorization: `Bearer ${newToken}` },
-        credentials: 'include',
-        cache: 'no-store',
-      });
-    }
-  }
-
-  if (!response.ok) {
-    throw new Error('Could not download the file.');
-  }
-
-  return response.blob();
-}
-
 export const apiClient = {
-  get: <T>(path: string) => request<T>(path, { method: 'GET' }),
-  downloadFile,
+  get: <T>(path: string, options?: Pick<RequestInit, 'signal'>) =>
+    request<T>(path, { method: 'GET', ...options }),
   post: <T>(path: string, body?: unknown) =>
-    request<T>(path, {
-      method: 'POST',
-      body: body ? JSON.stringify(body) : undefined,
-    }),
+    request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
   put: <T>(path: string, body?: unknown) =>
-    request<T>(path, {
-      method: 'PUT',
-      body: body ? JSON.stringify(body) : undefined,
-    }),
+    request<T>(path, { method: 'PUT', body: body === undefined ? undefined : JSON.stringify(body) }),
   patch: <T>(path: string, body?: unknown) =>
-    request<T>(path, {
-      method: 'PATCH',
-      body: body ? JSON.stringify(body) : undefined,
-    }),
+    request<T>(path, { method: 'PATCH', body: body === undefined ? undefined : JSON.stringify(body) }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
 };

@@ -1,0 +1,567 @@
+========== 1. NEW PAYMENT SERVICE TESTS ==========
+diff --git a/backend/apps/payments/tests/test_services.py b/backend/apps/payments/tests/test_services.py
+index c798f1e..2c0629d 100644
+--- a/backend/apps/payments/tests/test_services.py
++++ b/backend/apps/payments/tests/test_services.py
+@@ -420,8 +420,95 @@ def test_verify_webhook_signature_rejects_when_secret_unconfigured(settings):
+ 
+     assert services.verify_webhook_signature(raw_body=b"{}", signature_header="anything") is False
+ 
+ 
++# --------------------------------------------------------------------------
++# missed-webhook transaction reconciliation
++# --------------------------------------------------------------------------
++
++
++@mock.patch("apps.notifications.tasks.send_notification.delay")
++@mock.patch("apps.payments.tasks.render_and_store_receipt.delay")
++@mock.patch("apps.payments.services.requests.get")
++@mock.patch("apps.payments.services._initialize_chapa_checkout", return_value=FAKE_CHECKOUT_URL)
++def test_verify_transaction_with_chapa_confirms_matching_existing_payment(
++    mock_init, mock_get, mock_render, mock_notify
++):
++    booking = _make_booking()
++    payment = services.create_checkout_session(booking=booking)
++    mock_get.return_value = mock.Mock(
++        ok=True,
++        json=lambda: {
++            "status": "success",
++            "data": {
++                "tx_ref": payment.tx_ref,
++                "status": "success",
++                "amount": "200.00",
++                "currency": "ETB",
++            },
++        },
++    )
++
++    result = services.verify_transaction_with_chapa(payment=payment)
++
++    booking.refresh_from_db()
++    assert result.status == Payment.Status.COMPLETED
++    assert booking.status == Booking.Status.PENDING
++    mock_get.assert_called_once()
++
++
++@mock.patch("apps.payments.services.requests.get")
++@mock.patch("apps.payments.services._initialize_chapa_checkout", return_value=FAKE_CHECKOUT_URL)
++def test_verify_transaction_with_chapa_preserves_pending_payment(mock_init, mock_get):
++    booking = _make_booking()
++    payment = services.create_checkout_session(booking=booking)
++    mock_get.return_value = mock.Mock(
++        ok=True,
++        json=lambda: {
++            "status": "success",
++            "data": {
++                "tx_ref": payment.tx_ref,
++                "status": "pending",
++                "amount": "200.00",
++                "currency": "ETB",
++            },
++        },
++    )
++
++    result = services.verify_transaction_with_chapa(payment=payment)
++
++    booking.refresh_from_db()
++    result.refresh_from_db()
++    assert result.status == Payment.Status.INITIATED
++    assert booking.status == Booking.Status.AWAITING_PAYMENT
++    assert result.confirmed_at is None
++
++
++@mock.patch("apps.payments.services.requests.get")
++@mock.patch("apps.payments.services._initialize_chapa_checkout", return_value=FAKE_CHECKOUT_URL)
++def test_verify_transaction_with_chapa_rejects_amount_mismatch(mock_init, mock_get):
++    booking = _make_booking()
++    payment = services.create_checkout_session(booking=booking)
++    mock_get.return_value = mock.Mock(
++        ok=True,
++        json=lambda: {
++            "status": "success",
++            "data": {
++                "tx_ref": payment.tx_ref,
++                "status": "success",
++                "amount": "999.00",
++                "currency": "ETB",
++            },
++        },
++    )
++
++    with pytest.raises(ValidationError):
++        services.verify_transaction_with_chapa(payment=payment)
++
++    booking.refresh_from_db()
++    assert booking.status == Booking.Status.AWAITING_PAYMENT
++
++
+ # --------------------------------------------------------------------------
+ # confirm_payment_from_webhook (FR-PAY-002, FR-PAY-004)
+ # --------------------------------------------------------------------------
+ 
+
+========== 2. CURRENT CHECKOUT AND RETRY LOGIC ==========
+221: 
+222:     checkout_url = (data.get("data") or {}).get("checkout_url")
+223:     if data.get("status") != "success" or not checkout_url:
+224:         logger.error(
+225:             "Chapa returned an unexpected response for booking %s: %s", booking.id, data
+226:         )
+227:         raise PaymentGatewayError()
+228: 
+229:     return checkout_url
+230: 
+231: 
+232: @transaction.atomic
+233: def create_checkout_session(*, booking, amount=None, return_target="website"):
+234:     """Implements FR-PAY-001 and Document 04's "response includes a
+235:     checkout URL" on `POST /bookings` (individual or group alike).
+236: 
+237:     `amount` defaults to `booking.total_amount_etb` -- correct for a
+238:     booking's first-ever payment, since nothing has been paid yet. The
+239:     ID-verification addendum's category-correction flow
+240:     (`apps.bookings.views.BookingCategoryCorrectionView`) passes an
+241:     explicit `amount` instead: just the outstanding difference for an
+242:     undercharge, since part of the (now higher) `total_amount_etb` was
+243:     already paid and confirmed before the correction. Either way, this
+244:     is a *second* `Payment` row against the same booking in the
+245:     correction case -- `Payment`'s own docstring already documents a
+246:     booking accumulating more than one row (a retried checkout after a
+247:     failed attempt is the other case), so no model change was needed for
+248:     this to work.
+249: 
+250:     Idempotency guard: if this booking already has an open (`initiated`)
+251:     payment with a `checkout_url`, that session is reused instead of
+252:     opening a second one with Chapa -- covers a retried request, in the
+253:     same spirit as NFR-IDEMPOTENT-001 even though FR-PAY-004's own
+254:     DB-level guarantee (`tx_ref` UNIQUE) is specifically about the
+255:     *webhook* side. Reused as-is, correction included: by the time a
+256:     correction runs, the booking's original payment is always already
+257:     `completed` (the booking had to be `Pending` to be corrected), so this
+258:     guard can only ever find an `initiated` row left behind by a retried
+259:     attempt at the *same* correction, never the original payment.
+260:     """
+261:     if booking.status != Booking.Status.AWAITING_PAYMENT:
+262:         raise Conflict("This booking is not awaiting payment.")
+263: 
+264:     if amount is None:
+265:         amount = booking.total_amount_etb
+266: 
+267:     existing = (
+268:         Payment.objects.select_for_update()
+269:         .filter(booking=booking, status=Payment.Status.INITIATED)
+270:         .order_by("-created_at")
+271:         .first()
+272:     )
+273:     if existing is not None and existing.checkout_url:
+274:         return existing
+275: 
+276:     tx_ref = _generate_tx_ref(booking)
+277:     checkout_args = {"tx_ref": tx_ref, "booking": booking, "amount": amount}
+278:     if return_target in {"mobile_web", "mobile_native"}:
+279:         checkout_args["return_target"] = return_target
+280:     checkout_url = _initialize_chapa_checkout(**checkout_args)
+281: 
+282:     payment = Payment.objects.create(
+283:         booking=booking,
+284:         tx_ref=tx_ref,
+285:         amount_etb=amount,
+286:         currency="ETB",
+287:         checkout_url=checkout_url,
+288:     )
+289: 
+290:     booking.chapa_checkout_url = checkout_url
+291:     booking.save(update_fields=["chapa_checkout_url", "updated_at"])
+292: 
+293:     write_audit_log(
+294:         actor_id=booking.visitor_id,
+295:         action="payment.checkout_initiated",
+296:         target_type="payment",
+297:         target_id=payment.id,
+298:         metadata={"booking_id": str(booking.id), "tx_ref": tx_ref},
+299:     )
+300:     return payment
+301: 
+302: 
+303: def invalidate_open_checkout_sessions(*, booking):
+304:     """Marks any still-`initiated` `Payment` row against `booking` as
+305:     `failed`, so `create_checkout_session`'s own idempotency guard (see
+306:     its docstring above) won't hand back a checkout session that was
+307:     opened against a total the booking no longer has.
+308: 
+309:     Called by `apps.bookings.views.BookingDetailView.patch` right before
+310:     it opens a fresh session for a Visitor-edited booking's new total
+311:     (`apps.bookings.services.update_awaiting_payment_booking`) -- without
+312:     this, a Visitor who edits her ticket quantities after already opening
+313:     the Chapa checkout page would still be charged the pre-edit amount.
+314:     A no-op if there's no open session yet (e.g. she edits before ever
+315:     clicking "Pay Now").
+
+========== 3. CURRENT PAYMENT VIEWS ==========
+1: """
+2: HTTP concerns only: routing to a service call, permission checks, and
+3: response status codes. No business logic here (Design Spec Sec 3.1).
+4: """
+5: 
+6: from drf_spectacular.utils import extend_schema
+7: from rest_framework import permissions, status
+8: from rest_framework.response import Response
+9: from rest_framework.views import APIView
+10: from rest_framework.generics import get_object_or_404
+11: 
+12: from apps.bookings.models import Booking
+13: from apps.bookings.serializers import BookingSerializer
+14: from apps.core.permissions import IsVisitor
+15: from . import services
+16: from .models import Payment
+17: from .serializers import ChapaWebhookSerializer
+18: 
+19: 
+20: class ChapaWebhookView(APIView):
+21:     """POST /payments/webhooks/chapa/ -- AllowAny + signature check
+22:     (Design Spec Sec 4.2; NFR-SEC-001). The only path that confirms a
+23:     booking (FR-PAY-002) -- never the client-side `return_url` redirect.
+24:     """
+25: 
+26:     permission_classes = [permissions.AllowAny]
+27:     authentication_classes = []
+28: 
+29:     @extend_schema(
+30:         operation_id="handleChapaWebhook",
+31:         request=ChapaWebhookSerializer,
+32:         responses={200: None, 400: None, 401: None},
+33:     )
+34:     def post(self, request, *args, **kwargs):
+35:         # Chapa sends two different headers with two different formulas:
+36:         #   X-Chapa-Signature = HMAC_SHA256(secret, raw_body)  -- verifies the event body
+37:         #   Chapa-Signature   = HMAC_SHA256(secret, secret)    -- constant, NOT payload-based
+38:         # We must check X-Chapa-Signature first (it's the one verify_webhook_signature
+39:         # actually validates against); falling back to Chapa-Signature here would only
+40:         # ever match a secret-derived constant, which never equals HMAC(secret, body).
+41:         signature = request.headers.get("X-Chapa-Signature") or request.headers.get(
+42:             "Chapa-Signature"
+43:         )
+44:         if not services.verify_webhook_signature(
+45:             raw_body=request.body, signature_header=signature
+46:         ):
+47:             return Response(
+48:                 {
+49:                     "error": {
+50:                         "code": "UNAUTHORIZED",
+51:                         "message": "Invalid webhook signature.",
+52:                         "field_errors": {},
+53:                     }
+54:                 },
+55:                 status=status.HTTP_401_UNAUTHORIZED,
+56:             )
+57: 
+58:         serializer = ChapaWebhookSerializer(data=request.data)
+59:         serializer.is_valid(raise_exception=True)
+60: 
+61:         # The full raw payload (not just validated_data) is what gets
+62:         # stored/interpreted -- Chapa's payload carries fields beyond the
+63:         # two validated here (Document 04's `additionalProperties: true`).
+64:         services.confirm_payment_from_webhook(payload=request.data)
+65:         return Response(status=status.HTTP_200_OK)
+66: 
+67: 
+68: class PaymentVerificationView(APIView):
+69:     """POST /payments/bookings/{booking_id}/verify/.
+70: 
+71:     Reconciles an existing checkout with Chapa when its webhook was missed.
+72:     The visitor can only reconcile their own booking; no client-supplied
+73:     transaction reference or payment status is accepted.
+74:     """
+75: 
+76:     permission_classes = [IsVisitor]
+77: 
+78:     @extend_schema(responses={200: BookingSerializer})
+79:     def post(self, request, booking_id):
+80:         booking = get_object_or_404(
+81:             Booking.objects.filter(visitor=request.user),
+82:             id=booking_id,
+83:         )
+84:         payment = (
+85:             Payment.objects.filter(
+86:                 booking=booking,
+87:                 status=Payment.Status.INITIATED,
+88:             )
+89:             .order_by("-created_at")
+90:             .first()
+91:         )
+92:         if payment is None:
+93:             return Response(BookingSerializer(booking).data)
+94: 
+95:         services.verify_transaction_with_chapa(payment=payment)
+96:         booking.refresh_from_db()
+97:         return Response(BookingSerializer(booking).data)
+
+========== 4. CURRENT PAYMENT VIEW TESTS ==========
+"""
+HTTP-level tests for the Chapa webhook endpoint's signature-check wiring
+(Design Spec Sec 3.1: services.py, exercised in test_services.py, assumes
+the caller is already verified -- this module proves that boundary from
+the outside, mirroring apps.bookings.tests.test_views).
+"""
+
+import hashlib
+import hmac
+import json
+from datetime import date, timedelta
+from decimal import Decimal
+from unittest import mock
+
+import pytest
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from apps.accounts.models import Account
+from apps.bookings.models import Booking, BookingItem
+from apps.catalog.models import Category
+from apps.payments.models import Payment
+
+pytestmark = pytest.mark.django_db
+
+TOMORROW = date.today() + timedelta(days=1)
+WEBHOOK_URL = "/api/v1/payments/webhooks/chapa/"
+
+
+def _make_visitor(email="visitor@example.com"):
+    account = Account(email=email, full_name="Visitor Person", role=Account.Role.VISITOR)
+    account.set_unusable_password()
+    account.email_verified_at = timezone.now()
+    account.phone_verified_at = timezone.now()
+    account.save()
+    return account
+
+
+def _make_payment(status=Payment.Status.INITIATED):
+    visitor = _make_visitor()
+    category = Category.objects.create(
+        name_en="Adult", name_am="Adult", price_etb=Decimal("100.00")
+    )
+    booking = Booking.objects.create(
+        visitor=visitor,
+        visit_date=TOMORROW,
+        booking_type=Booking.BookingType.INDIVIDUAL,
+        booked_quantity=1,
+        total_amount_etb=category.price_etb,
+        status=Booking.Status.AWAITING_PAYMENT,
+    )
+    BookingItem.objects.create(
+        booking=booking,
+        category=category,
+        category_name_en=category.name_en,
+        category_name_am=category.name_am,
+        unit_price_etb=category.price_etb,
+        quantity=1,
+        subtotal_etb=category.price_etb,
+    )
+    return Payment.objects.create(
+        booking=booking,
+        tx_ref="museum-test-tx-ref",
+        amount_etb=category.price_etb,
+        status=status,
+    )
+
+
+def _signed_post(client, body: dict, secret: str, decoy_chapa_signature: str = None):
+    """Sends X-Chapa-Signature (the real, payload-based HMAC). Optionally also
+    sends Chapa-Signature (Chapa's other header, HMAC(secret, secret) in
+    production -- constant, not payload-derived) to mimic a real Chapa
+    request and prove it's correctly ignored.
+    """
+    raw = json.dumps(body).encode("utf-8")
+    signature = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    extra = {}
+    if decoy_chapa_signature is not None:
+        extra["HTTP_CHAPA_SIGNATURE"] = decoy_chapa_signature
+    return client.post(
+        WEBHOOK_URL,
+        data=raw,
+        content_type="application/json",
+        HTTP_X_CHAPA_SIGNATURE=signature,
+        **extra,
+    )
+
+
+@mock.patch("apps.notifications.tasks.send_notification.delay")
+@mock.patch("apps.payments.tasks.render_and_store_receipt.delay")
+def test_webhook_confirms_payment_with_a_valid_signature(mock_render, mock_notify, settings):
+    settings.CHAPA_WEBHOOK_SECRET = "test-webhook-secret"
+    payment = _make_payment()
+
+    response = _signed_post(
+        APIClient(),
+        {"tx_ref": payment.tx_ref, "status": "success"},
+        secret="test-webhook-secret",
+    )
+
+    assert response.status_code == 200
+    payment.refresh_from_db()
+    assert payment.status == Payment.Status.COMPLETED
+
+
+def test_webhook_rejects_invalid_signature(settings):
+    settings.CHAPA_WEBHOOK_SECRET = "test-webhook-secret"
+    payment = _make_payment()
+
+    response = _signed_post(
+        APIClient(),
+        {"tx_ref": payment.tx_ref, "status": "success"},
+        secret="wrong-secret",
+    )
+
+    assert response.status_code == 401
+    payment.refresh_from_db()
+    assert payment.status == Payment.Status.INITIATED
+
+
+@mock.patch("apps.notifications.tasks.send_notification.delay")
+@mock.patch("apps.payments.tasks.render_and_store_receipt.delay")
+def test_webhook_confirms_payment_when_decoy_chapa_signature_header_also_present(
+    mock_render, mock_notify, settings
+):
+    """Regression test: Chapa sends both `Chapa-Signature` (a constant,
+    HMAC(secret, secret) -- never equal to HMAC(secret, body)) and
+    `X-Chapa-Signature` (the real payload signature) on real webhook
+    calls. The view must verify against X-Chapa-Signature and must NOT
+    let the presence of the decoy header cause a false rejection.
+    """
+    settings.CHAPA_WEBHOOK_SECRET = "test-webhook-secret"
+    payment = _make_payment()
+    decoy = hmac.new(
+        b"test-webhook-secret", b"test-webhook-secret", hashlib.sha256
+    ).hexdigest()
+
+    response = _signed_post(
+        APIClient(),
+        {"tx_ref": payment.tx_ref, "status": "success"},
+        secret="test-webhook-secret",
+        decoy_chapa_signature=decoy,
+    )
+
+    assert response.status_code == 200
+    payment.refresh_from_db()
+    assert payment.status == Payment.Status.COMPLETED
+
+
+def test_webhook_rejects_missing_signature_header(settings):
+    settings.CHAPA_WEBHOOK_SECRET = "test-webhook-secret"
+    payment = _make_payment()
+
+    response = APIClient().post(
+        WEBHOOK_URL,
+        data=json.dumps({"tx_ref": payment.tx_ref, "status": "success"}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 401
+
+
+def test_webhook_returns_400_for_unknown_tx_ref(settings):
+    settings.CHAPA_WEBHOOK_SECRET = "test-webhook-secret"
+
+    response = _signed_post(
+        APIClient(),
+        {"tx_ref": "no-such-tx-ref", "status": "success"},
+        secret="test-webhook-secret",
+    )
+
+    assert response.status_code == 400
+
+
+========== 5. PAYMENT ROUTE MOUNTING ==========
+"""
+Root URLconf. Every Django app's own urls.py is included under
+/api/v1/<app-name>/, mirroring the module boundaries in Design Spec Sec 3.2
+so the API surface maps predictably to Document 04 (OpenAPI Specification).
+"""
+
+from django.conf import settings
+from django.conf.urls.static import static
+from django.contrib import admin
+from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+
+from apps.accounts.views import CookieTokenRefreshView, CurrentUserView
+from apps.bookings.urls import availability_urlpatterns
+from apps.bookings.views import MyBookingsView
+from apps.core import health
+from apps.entrance.urls import entrance_urlpatterns
+from apps.refunds.urls import refund_request_urlpatterns
+
+urlpatterns = [
+    # Phase 8: probes live outside /api/v1 and outside the contract.
+    path("healthz", health.liveness, name="healthz"),
+    path("readyz", health.readiness, name="readyz"),
+    path("admin/", admin.site.urls),
+
+    # Contract-first: the schema is introspected from the actual views/
+    # serializers below and exported to ../contracts/openapi.yaml via
+    # `scripts/export_contract.sh`. That file is what frontend/ builds its
+    # types against. The live /api/schema/ routes are dev-only (bottom of file).
+
+    # Auth -- both credential paths share one refresh endpoint (Sec 4.1).
+    # CookieTokenRefreshView (apps.accounts.views) reads/rotates the
+    # refresh token from its httpOnly cookie -- see apps/accounts/cookies.py.
+    path("api/v1/auth/", include("apps.accounts.urls")),
+    path("api/v1/auth/refresh/", CookieTokenRefreshView.as_view(), name="token_refresh"),
+
+    # Document 04 places the profile endpoint under /users/, not /auth/ --
+    # mounted directly here rather than via apps.accounts.urls, which is
+    # scoped to /api/v1/auth/ only.
+    path("api/v1/users/me/", CurrentUserView.as_view(), name="current-user"),
+    path("api/v1/users/me/bookings/", MyBookingsView.as_view(), name="my-bookings"),
+
+    # Document 04: `/categories` and `/categories/{id}` are top-level
+    # resources (no `/catalog` segment) -- unlike most other apps below,
+    # this app's urls.py is included at the `/api/v1/` root directly.
+    path("api/v1/", include("apps.catalog.urls")),
+    # UAT round 1: `/institutions` is likewise top-level, same reasoning
+    # as `/categories` above.
+    path("api/v1/", include("apps.institutions.urls")),
+    # Likewise `/availability` and `/availability/{date}` are top-level
+    # (no `/bookings` segment) per Document 04.
+    path("api/v1/", include(availability_urlpatterns)),
+    path("api/v1/bookings/", include("apps.bookings.urls")),
+    path("api/v1/payments/", include("apps.payments.urls")),
+    # Document 04 places `/bookings/lookup` and `/bookings/{id}/check-in`
+    # at the top level (no `/entrance` segment), even though `apps.entrance`
+    # owns the business logic behind them (Design Spec Sec 3.2) -- see
+    # apps/entrance/urls.py's module docstring.
+    path("api/v1/", include(entrance_urlpatterns)),
+    # Document 04 places `/bookings/{id}/refund-requests` at the top
+    # level (no `/refunds` segment), even though `apps.refunds` owns the
+    # business logic behind it -- see apps/refunds/urls.py's module
+    # docstring.
+    path("api/v1/", include(refund_request_urlpatterns)),
+    path("api/v1/refunds/", include("apps.refunds.urls")),
+    path("api/v1/settlement/", include("apps.settlement.urls")),
+    # Document 04's actual paths are `/reports/dashboard` and
+    # `/reports/summary` -- `apps.reporting` owns the business logic
+    # (Design Spec Sec 3.2), but is mounted under `/reports/`, not
+    # `/reporting/`, to match the contract exactly.
+    path("api/v1/reports/", include("apps.reporting.urls")),
+    path("api/v1/notifications/", include("apps.notifications.urls")),
+    path("api/v1/admin/", include("apps.platform_admin.urls")),
+]
+
+# Serve user-uploaded/generated media (e.g. temporary receipt PDFs) locally.
+# Only wired up when DEBUG=True (dev), since in staging/production media
+# should be served by the reverse proxy or object storage, not Django --
+# see Doc 08 Sec 3.2.
+# Phase 8: the schema and Swagger UI are developer tooling, not a public
+# endpoint -- they describe every route (including staff/admin ones) to
+# anyone who asks. Served only in DEBUG, or where an operator explicitly
+# opts in with ENABLE_API_DOCS=true (e.g. a private staging host). The
+# committed `contracts/openapi.yaml` is generated by `manage.py
+# spectacular` and needs no URL.
+if settings.DEBUG or settings.ENABLE_API_DOCS:
+    urlpatterns += [
+        path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+        path("api/schema/swagger-ui/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    ]
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

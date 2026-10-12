@@ -143,15 +143,15 @@ services:
 
   web:
     build:
-      context: ./frontend
+      context: ./frontend_web
     volumes:
-      - ./frontend:/app
+      - ./frontend_web:/app
       - ./contracts:/contracts
       - /app/node_modules
       - /app/.next
       - .:/workspace
     env_file:
-      - ./frontend/.env.local
+      - ./frontend_web/.env.local
     environment:
       WATCHPACK_POLLING: "true"
     ports:
