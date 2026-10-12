@@ -4,6 +4,8 @@ import { Clock, MapPin, CalendarDays, ChevronRight, ArrowUpRight, Ticket } from 
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from '../../src/lib/i18n/useTranslation';
 import { getMyBookings } from '../../src/lib/api/services';
+import { useAuth } from '../../src/hooks/useAuth';
+import { todayIso } from '../../src/lib/dates';
 import { colors, radii, shadows } from '../../src/theme';
 
 const { width } = Dimensions.get('window');
@@ -11,12 +13,16 @@ const { width } = Dimensions.get('window');
 export default function VisitorHome() {
   const router = useRouter();
   const { t } = useTranslation();
+  const { isAuthenticated } = useAuth();
   const { data: bookings } = useQuery({
-    queryKey: ['myBookings'],
-    queryFn: () => getMyBookings({ limit: 1, offset: 0 }),
+    queryKey: ['myBookings', 'home'],
+    queryFn: () => getMyBookings({ limit: 100, offset: 0 }),
+    enabled: isAuthenticated,
     staleTime: 60_000,
   });
-  const upcoming = bookings?.data?.find((item) => item.status === 'pending' || item.status === 'awaiting_payment');
+  const upcoming = (bookings?.data ?? [])
+    .filter((b) => (b.status === 'pending' || b.status === 'awaiting_payment') && b.visitDate >= todayIso())
+    .sort((a, b) => a.visitDate.localeCompare(b.visitDate))[0];
 
   return (
     <ScrollView style={styles.container} bounces={false} showsVerticalScrollIndicator={false}>
@@ -78,6 +84,14 @@ export default function VisitorHome() {
           >
             <CalendarDays color="#FFF" size={20} />
             <Text style={styles.bookButtonText}>{t('book_now')}</Text>
+            <ChevronRight color="#FFF" size={20} style={styles.buttonIconRight} />
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [styles.bookButton, { backgroundColor: colors.gold, marginTop: 12 }, pressed && styles.pressed]}
+            onPress={() => router.push('/(visitor)/group' as never)}
+          >
+            <Ticket color="#FFF" size={20} />
+            <Text style={styles.bookButtonText}>{t('book_for_school_institution')}</Text>
             <ChevronRight color="#FFF" size={20} style={styles.buttonIconRight} />
           </Pressable>
         </View>

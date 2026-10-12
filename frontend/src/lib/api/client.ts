@@ -1,116 +1,136 @@
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 
+// Backend error envelope: { error: { code, message, fieldErrors? } }
 export class ApiError extends Error {
-  constructor(public payload: unknown, public status?: number) {
-    super(getApiErrorMessage(payload, status));
+  status?: number;
+  code?: string;
+  fieldErrors?: Record<string, string>;
+  payload: unknown;
+  constructor(payload: unknown, status?: number) {
+    const parsed = parseError(payload, status);
+    super(parsed.message);
     this.name = 'ApiError';
+    this.payload = payload;
+    this.status = status;
+    this.code = parsed.code;
+    this.fieldErrors = parsed.fieldErrors;
   }
 }
 
-function getApiErrorMessage(payload: unknown, status?: number): string {
-  if (typeof payload === 'string' && payload.trim()) return payload;
-  if (!payload || typeof payload !== 'object') {
-    return `The server rejected the request${status ? ` (HTTP ${status})` : ''}.`;
+type Parsed = { message: string; code?: string; fieldErrors?: Record<string, string> };
+function parseError(payload: unknown, status?: number): Parsed {
+  const fallback = `The server rejected the request${status ? ` (HTTP ${status})` : ''}.`;
+  if (typeof payload === 'string' && payload.trim()) return { message: payload };
+  if (!payload || typeof payload !== 'object') return { message: fallback };
+  const body = payload as { detail?: unknown; message?: unknown; error?: { code?: string; message?: string; fieldErrors?: Record<string, unknown> } | string };
+  const err = body.error;
+  if (typeof err === 'string' && err.trim()) return { message: err };
+  if (err && typeof err === 'object') {
+    const fe = err.fieldErrors
+      ? Object.fromEntries(Object.entries(err.fieldErrors).map(([k, v]) => [k, String(v)]))
+      : undefined;
+    const message =
+      (typeof err.message === 'string' && err.message.trim()) ||
+      (fe && Object.values(fe).join(' ')) ||
+      fallback;
+    return { message, code: err.code, fieldErrors: fe };
   }
-
-  const body = payload as {
-    detail?: unknown;
-    message?: unknown;
-    error?: { message?: unknown; fieldErrors?: unknown } | string;
-  };
-  const error = body.error;
-  if (typeof error === 'string' && error.trim()) return error;
-  if (error && typeof error === 'object') {
-    if (typeof error.message === 'string' && error.message.trim()) {
-      return error.message;
-    }
-    if (error.fieldErrors && typeof error.fieldErrors === 'object') {
-      return Object.entries(error.fieldErrors)
-        .map(([field, message]) => `${field}: ${String(message)}`)
-        .join(' ');
-    }
-  }
-  if (typeof body.detail === 'string' && body.detail.trim()) return body.detail;
-  if (typeof body.message === 'string' && body.message.trim()) return body.message;
-
-  return `The server rejected the request${status ? ` (HTTP ${status})` : ''}.`;
-}
-
-export function getApiErrorMessageForDisplay(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof ApiTimeoutError) return error.message;
-  if (error instanceof Error) return error.message;
-  return 'Could not complete the request. Please try again.';
+  if (typeof body.detail === 'string' && body.detail.trim()) return { message: body.detail };
+  if (typeof body.message === 'string' && body.message.trim()) return { message: body.message };
+  return { message: fallback };
 }
 
 export class ApiTimeoutError extends Error {
   constructor() {
-    super('The request timed out. Check the backend URL and network connection.');
+    super('The request timed out. Check your connection and try again.');
     this.name = 'ApiTimeoutError';
   }
 }
 
-const API_BASE = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+export function getApiErrorMessageForDisplay(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return 'Could not complete the request. Please try again.';
+}
+
+const API_BASE = (process.env.EXPO_PUBLIC_API_URL || 'http://localhost:8000/api/v1').replace(/\/+$/, '');
 const ACCESS_TOKEN_KEY = 'auth_access_token';
-const REFRESH_TOKEN_KEY = 'auth_refresh_token';
-const REQUEST_TIMEOUT_MS = 10000;
-const canUseNativeSecureStore = Platform.OS !== 'web';
+const DEFAULT_TIMEOUT_MS = 15000;
+const BOOKING_CREATE_TIMEOUT_MS = 45000; // server calls Chapa inside this request
+const native = Platform.OS !== 'web';
 
-let inMemoryAccessToken: string | null = null;
+let accessToken: string | null = null;
 export let currentLanguageHeader = 'en';
-
 export function setGlobalLanguage(lang: string) {
   currentLanguageHeader = lang;
 }
 
-export async function setAuthTokens(access: string, refresh?: string) {
-  inMemoryAccessToken = access;
-  if (!canUseNativeSecureStore) return;
-  await SecureStore.setItemAsync(ACCESS_TOKEN_KEY, access);
-  if (refresh) await SecureStore.setItemAsync(REFRESH_TOKEN_KEY, refresh);
+const authLostListeners = new Set<() => void>();
+export function onAuthLost(cb: () => void) {
+  authLostListeners.add(cb);
+  return () => { authLostListeners.delete(cb); };
 }
 
+export async function setAuthTokens(access: string) {
+  accessToken = access;
+  if (native) await SecureStore.setItemAsync(ACCESS_TOKEN_KEY, access);
+}
 export async function getAccessToken() {
-  if (inMemoryAccessToken) return inMemoryAccessToken;
-  if (!canUseNativeSecureStore) return null;
-  inMemoryAccessToken = await SecureStore.getItemAsync(ACCESS_TOKEN_KEY);
-  return inMemoryAccessToken;
+  if (accessToken) return accessToken;
+  if (!native) return null;
+  accessToken = await SecureStore.getItemAsync(ACCESS_TOKEN_KEY);
+  return accessToken;
 }
-
-export async function getRefreshToken() {
-  if (!canUseNativeSecureStore) return null;
-  return SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
-}
-
 export async function clearAuthTokens() {
-  inMemoryAccessToken = null;
-  if (!canUseNativeSecureStore) return;
-  await SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY);
-  await SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY);
+  accessToken = null;
+  if (native) await SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY);
 }
 
-let inFlightRefresh: Promise<string | null> | null = null;
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const ext = options.signal;
+  const onAbort = () => controller.abort();
+  if (ext) {
+    if (ext.aborted) controller.abort();
+    else ext.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (controller.signal.aborted && !ext?.aborted) throw new ApiTimeoutError();
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    ext?.removeEventListener('abort', onAbort);
+  }
+}
 
+// The backend keeps the refresh token ONLY in an httpOnly cookie
+// (apps.accounts.cookies) and its refresh endpoint ignores any request body.
+// So we send no body and let the platform cookie jar attach it.
+let inFlightRefresh: Promise<string | null> | null = null;
 export async function refreshAccessToken(): Promise<string | null> {
   if (inFlightRefresh) return inFlightRefresh;
   inFlightRefresh = (async () => {
     try {
-      const refreshToken = await getRefreshToken();
-      if (!refreshToken) return null;
-      const response = await fetchWithTimeout(`${API_BASE}/auth/refresh/`, {
+      const res = await fetchWithTimeout(`${API_BASE}/auth/refresh/`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Accept-Language': currentLanguageHeader },
         credentials: 'include',
-        body: JSON.stringify({ refresh: refreshToken }),
       });
-      if (!response.ok) {
-        await clearAuthTokens();
+      if (!res.ok) {
+        if (res.status === 401) {
+          await clearAuthTokens();
+          authLostListeners.forEach((cb) => cb());
+        }
         return null;
       }
-      const data: { access: string; refresh?: string } = await response.json();
-      await setAuthTokens(data.access, data.refresh ?? refreshToken);
+      const data: { access: string } = await res.json();
+      await setAuthTokens(data.access);
       return data.access;
+    } catch {
+      return null; // offline etc.: do not sign the visitor out
     } finally {
       inFlightRefresh = null;
     }
@@ -120,35 +140,12 @@ export async function refreshAccessToken(): Promise<string | null> {
 
 function normalizePath(path: string) {
   const [pathname, search] = path.split('?');
-  const normalized = pathname.endsWith('/') ? pathname : `${pathname}/`;
-  return search ? `${normalized}?${search}` : normalized;
+  const p = pathname.endsWith('/') ? pathname : `${pathname}/`;
+  return search ? `${p}?${search}` : p;
 }
 
-async function fetchWithTimeout(url: string, options: RequestInit = {}) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  const externalSignal = options.signal;
-  const abortFromExternalSignal = () => controller.abort();
-  if (externalSignal) {
-    if (externalSignal.aborted) controller.abort();
-    else externalSignal.addEventListener('abort', abortFromExternalSignal, { once: true });
-  }
-
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } catch (error) {
-    if (controller.signal.aborted && !externalSignal?.aborted) {
-      throw new ApiTimeoutError();
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeoutId);
-    externalSignal?.removeEventListener('abort', abortFromExternalSignal);
-  }
-}
-
-async function request<T>(path: string, options: RequestInit = {}, isRetry = false): Promise<T> {
-  const normalizedPath = normalizePath(path);
+async function request<T>(path: string, options: RequestInit = {}, isRetry = false, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+  const normalized = normalizePath(path);
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Accept-Language': currentLanguageHeader,
@@ -159,19 +156,16 @@ async function request<T>(path: string, options: RequestInit = {}, isRetry = fal
 
   let response: Response;
   try {
-    response = await fetchWithTimeout(`${API_BASE}${normalizedPath}`, {
-      ...options,
-      headers,
-      credentials: 'include',
-    });
-  } catch (error) {
-    if (error instanceof ApiTimeoutError) throw error;
-    throw new Error('Network error: could not reach the server. Check the backend URL and connection.');
+    response = await fetchWithTimeout(`${API_BASE}${normalized}`, { ...options, headers, credentials: 'include' }, timeoutMs);
+  } catch (e) {
+    if (e instanceof ApiTimeoutError) throw e;
+    throw new Error('Network error: could not reach the server. Check your connection and try again.');
   }
 
-  if (response.status === 401 && !isRetry && !normalizedPath.startsWith('/auth/refresh')) {
-    const newToken = await refreshAccessToken();
-    if (newToken) return request<T>(path, options, true);
+  const isAuthCall = normalized.startsWith('/auth/');
+  if (response.status === 401 && !isRetry && !isAuthCall) {
+    const fresh = await refreshAccessToken();
+    if (fresh) return request<T>(path, options, true, timeoutMs);
   }
   if (response.status === 204) return undefined as T;
 
@@ -187,13 +181,12 @@ async function request<T>(path: string, options: RequestInit = {}, isRetry = fal
 }
 
 export const apiClient = {
-  get: <T>(path: string, options?: Pick<RequestInit, 'signal'>) =>
-    request<T>(path, { method: 'GET', ...options }),
-  post: <T>(path: string, body?: unknown) =>
-    request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
+  get: <T>(path: string, options?: Pick<RequestInit, 'signal'>) => request<T>(path, { method: 'GET', ...options }),
+  post: <T>(path: string, body?: unknown, timeoutMs?: number) =>
+    request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }, false, timeoutMs ?? DEFAULT_TIMEOUT_MS),
   put: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: 'PUT', body: body === undefined ? undefined : JSON.stringify(body) }),
   patch: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: 'PATCH', body: body === undefined ? undefined : JSON.stringify(body) }),
-  delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
 };
+export { BOOKING_CREATE_TIMEOUT_MS };
