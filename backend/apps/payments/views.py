@@ -3,12 +3,20 @@ HTTP concerns only: routing to a service call, permission checks, and
 response status codes. No business logic here (Design Spec Sec 3.1).
 """
 
+from django.conf import settings
+from django.http import HttpResponse
+from django.utils.html import escape
 from drf_spectacular.utils import extend_schema
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.generics import get_object_or_404
 
+from apps.bookings.models import Booking
+from apps.bookings.serializers import BookingSerializer
+from apps.core.permissions import IsVisitor
 from . import services
+from .models import Payment
 from .serializers import ChapaWebhookSerializer
 
 
@@ -58,3 +66,62 @@ class ChapaWebhookView(APIView):
         # two validated here (Document 04's `additionalProperties: true`).
         services.confirm_payment_from_webhook(payload=request.data)
         return Response(status=status.HTTP_200_OK)
+
+
+class PaymentVerificationView(APIView):
+    """POST /payments/bookings/{booking_id}/verify/.
+
+    Reconciles an existing checkout with Chapa when its webhook was missed.
+    The visitor can only reconcile their own booking; no client-supplied
+    transaction reference or payment status is accepted.
+    """
+
+    permission_classes = [IsVisitor]
+
+    @extend_schema(responses={200: BookingSerializer})
+    def post(self, request, booking_id):
+        booking = get_object_or_404(
+            Booking.objects.filter(visitor=request.user),
+            id=booking_id,
+        )
+        payment = (
+            Payment.objects.filter(
+                booking=booking,
+                status=Payment.Status.INITIATED,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        if payment is None:
+            return Response(BookingSerializer(booking).data)
+
+        services.verify_transaction_with_chapa(payment=payment)
+        booking.refresh_from_db()
+        return Response(BookingSerializer(booking).data)
+
+
+class MobilePaymentReturnView(APIView):
+    """GET /payments/mobile-return/{booking_id}/ -- HTTPS bridge into the app.
+
+    Some Chapa accounts only accept http(s) `return_url`s. Point
+    MOBILE_NATIVE_PAYMENT_RETURN_URL at this view and it forwards the browser
+    to the app deep link (MOBILE_APP_DEEP_LINK). It touches no booking state;
+    the app then asks the server to verify the payment with Chapa.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    @extend_schema(exclude=True)
+    def get(self, request, booking_id):
+        target = f"{settings.MOBILE_APP_DEEP_LINK.rstrip('/')}/{booking_id}"
+        # HttpResponseRedirect refuses custom schemes, so build the 302 by hand.
+        response = HttpResponse(
+            f'<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" '
+            f'content="0;url={escape(target)}"><title>Returning to the app</title>'
+            f'<p><a href="{escape(target)}">Return to the app</a></p>',
+            status=302,
+            content_type="text/html; charset=utf-8",
+        )
+        response["Location"] = target
+        return response

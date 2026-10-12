@@ -263,6 +263,12 @@ class BookingCreateSerializer(serializers.Serializer):
     # groupName is: the real requiredness is bookingType-conditional,
     # enforced below in `validate`, not a plain `required=True`.
     groupTin = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    paymentReturnTarget = serializers.ChoiceField(
+        choices=("website", "mobile_web", "mobile_native"),
+        required=False,
+        default="website",
+        write_only=True,
+    )
 
     def validate(self, attrs):
         if attrs["bookingType"] == Booking.BookingType.GROUP and not attrs.get("groupName"):
@@ -286,6 +292,7 @@ class BookingCreateSerializer(serializers.Serializer):
             "group_name": self.validated_data.get("groupName") or None,
             "group_contact_phone": self.validated_data.get("groupContactPhone") or None,
             "group_tin": self.validated_data.get("groupTin") or None,
+            "payment_return_target": self.validated_data["paymentReturnTarget"],
         }
 
 

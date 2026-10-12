@@ -28,6 +28,7 @@ import hmac
 import logging
 import re
 import uuid
+from decimal import Decimal, InvalidOperation
 
 import requests
 from django.conf import settings
@@ -146,7 +147,7 @@ def _build_chapa_description(booking):
     return truncated.strip()
 
 
-def _initialize_chapa_checkout(*, tx_ref, booking, amount):
+def _initialize_chapa_checkout(*, tx_ref, booking, amount, return_target="website"):
     """The one function that actually talks to Chapa -- isolated so
     services-level tests can monkeypatch this instead of the network
     (mirrors how `apps.notifications.tasks.send_notification` is mocked
@@ -173,7 +174,20 @@ def _initialize_chapa_checkout(*, tx_ref, booking, amount):
         "callback_url": (
             f"{settings.PUBLIC_API_BASE_URL.rstrip('/')}/api/v1/payments/webhooks/chapa/"
         ),
-        "return_url": f"{settings.PUBLIC_WEB_BASE_URL.rstrip('/')}/bookings/{booking.id}",
+        "return_url": (
+            f"{(
+                settings.MOBILE_NATIVE_PAYMENT_RETURN_URL
+                if return_target == "mobile_native"
+                else settings.MOBILE_PAYMENT_RETURN_URL
+            ).rstrip('/')}/{booking.id}"
+            if return_target in {"mobile_web", "mobile_native"}
+            and (
+                settings.MOBILE_NATIVE_PAYMENT_RETURN_URL
+                if return_target == "mobile_native"
+                else settings.MOBILE_PAYMENT_RETURN_URL
+            )
+            else f"{settings.PUBLIC_WEB_BASE_URL.rstrip('/')}/bookings/{booking.id}"
+        ),
         "customization": {
             "title": "Museum Ticket",
             "description": _build_chapa_description(booking),
@@ -216,7 +230,7 @@ def _initialize_chapa_checkout(*, tx_ref, booking, amount):
 
 
 @transaction.atomic
-def create_checkout_session(*, booking, amount=None):
+def create_checkout_session(*, booking, amount=None, return_target="website"):
     """Implements FR-PAY-001 and Document 04's "response includes a
     checkout URL" on `POST /bookings` (individual or group alike).
 
@@ -260,7 +274,10 @@ def create_checkout_session(*, booking, amount=None):
         return existing
 
     tx_ref = _generate_tx_ref(booking)
-    checkout_url = _initialize_chapa_checkout(tx_ref=tx_ref, booking=booking, amount=amount)
+    checkout_args = {"tx_ref": tx_ref, "booking": booking, "amount": amount}
+    if return_target in {"mobile_web", "mobile_native"}:
+        checkout_args["return_target"] = return_target
+    checkout_url = _initialize_chapa_checkout(**checkout_args)
 
     payment = Payment.objects.create(
         booking=booking,
@@ -335,16 +352,66 @@ def verify_webhook_signature(*, raw_body: bytes, signature_header) -> bool:
     return hmac.compare_digest(expected, signature_header)
 
 
+def verify_transaction_with_chapa(*, payment):
+    """Fetch and reconcile one existing transaction from Chapa.
+
+    This is a server-to-server recovery path for a missed webhook. It never
+    creates a checkout session and only applies a provider response after
+    matching the durable transaction reference, amount, and currency.
+    """
+    try:
+        response = requests.get(
+            f"{CHAPA_BASE_URL}/transaction/verify/{payment.tx_ref}",
+            headers={"Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}"},
+            timeout=CHAPA_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        provider_response = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.exception("Chapa transaction verification failed for payment %s", payment.id)
+        raise PaymentGatewayError() from exc
+
+    provider_data = provider_response.get("data") or {}
+    if provider_response.get("status") != "success":
+        raise PaymentGatewayError()
+    if provider_data.get("tx_ref") != payment.tx_ref:
+        raise ValidationError({"tx_ref": "Chapa returned an unexpected transaction reference."})
+    if str(provider_data.get("currency", "")).upper() != payment.currency.upper():
+        raise ValidationError({"currency": "Chapa returned an unexpected currency."})
+    try:
+        provider_amount = Decimal(str(provider_data.get("amount")))
+    except (InvalidOperation, TypeError):
+        raise ValidationError({"amount": "Chapa returned an invalid transaction amount."})
+    if provider_amount != payment.amount_etb:
+        raise ValidationError({"amount": "Chapa returned an unexpected transaction amount."})
+
+    provider_status = str(provider_data.get("status", "")).lower()
+    if provider_status in _CHAPA_SUCCESS_STATUSES:
+        # Only a *paid* result is applied. Pending/failed/cancelled results leave
+        # the payment untouched so the visitor can still retry the same checkout
+        # and the webhook stays the sole authority for failures.
+        return confirm_payment_from_webhook(
+            payload={
+                **provider_data,
+                "tx_ref": payment.tx_ref,
+                "status": provider_status,
+            },
+            record_webhook=False,
+        )
+    return payment
+
+
 # --------------------------------------------------------------------------
 # Webhook-confirmed payment (FR-PAY-002, FR-PAY-004)
 # --------------------------------------------------------------------------
 
 
 @transaction.atomic
-def confirm_payment_from_webhook(*, payload: dict):
-    """Implements FR-PAY-002/FR-PAY-004. The *only* path that confirms a
-    booking (Document 03 Sec 4.2) -- the client-side `return_url` redirect
-    after checkout is never trusted on its own.
+def confirm_payment_from_webhook(*, payload: dict, record_webhook=True):
+    """Implements FR-PAY-002/FR-PAY-004. Bookings are confirmed only from a
+    signed Chapa webhook or from `verify_transaction_with_chapa` (a
+    server-to-server lookup of the transaction at Chapa) -- the client-side
+    `return_url` redirect after checkout is never trusted on its own.
 
     Safe to call more than once for the same `tx_ref`: a payment that is
     already `confirmed_at` is a no-op that still records the replayed
@@ -363,19 +430,24 @@ def confirm_payment_from_webhook(*, payload: dict):
         raise ValidationError({"tx_ref": "Unknown transaction reference."})
 
     now = timezone.now()
-    payment.webhook_payload = payload
-    payment.webhook_received_at = now
+    if record_webhook:
+        payment.webhook_payload = payload
+        payment.webhook_received_at = now
 
     if payment.confirmed_at is not None:
-        payment.save(update_fields=["webhook_payload", "webhook_received_at", "updated_at"])
+        update_fields = ["updated_at"]
+        if record_webhook:
+            update_fields.extend(["webhook_payload", "webhook_received_at"])
+        payment.save(update_fields=update_fields)
         return payment
 
     gateway_status = str(payload.get("status", "")).lower()
     if gateway_status not in _CHAPA_SUCCESS_STATUSES:
         payment.status = Payment.Status.FAILED
-        payment.save(
-            update_fields=["status", "webhook_payload", "webhook_received_at", "updated_at"]
-        )
+        update_fields = ["status", "updated_at"]
+        if record_webhook:
+            update_fields.extend(["webhook_payload", "webhook_received_at"])
+        payment.save(update_fields=update_fields)
         write_audit_log(
             actor_id=None,
             action="payment.failed",
@@ -387,15 +459,10 @@ def confirm_payment_from_webhook(*, payload: dict):
 
     payment.status = Payment.Status.COMPLETED
     payment.confirmed_at = now
-    payment.save(
-        update_fields=[
-            "status",
-            "confirmed_at",
-            "webhook_payload",
-            "webhook_received_at",
-            "updated_at",
-        ]
-    )
+    update_fields = ["status", "confirmed_at", "updated_at"]
+    if record_webhook:
+        update_fields.extend(["webhook_payload", "webhook_received_at"])
+    payment.save(update_fields=update_fields)
 
     booking = payment.booking
     booking.status = Booking.Status.PENDING

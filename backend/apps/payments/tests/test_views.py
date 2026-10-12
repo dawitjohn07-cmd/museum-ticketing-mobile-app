@@ -170,3 +170,50 @@ def test_webhook_returns_400_for_unknown_tx_ref(settings):
     )
 
     assert response.status_code == 400
+
+@mock.patch("apps.payments.views.services.verify_transaction_with_chapa")
+def test_payment_verification_endpoint_checks_visitors_own_booking(mock_verify):
+    payment = _make_payment()
+    client = APIClient()
+    client.force_authenticate(user=payment.booking.visitor)
+
+    response = client.post(
+        f"/api/v1/payments/bookings/{payment.booking.id}/verify/",
+        data={},
+        format="json",
+    )
+
+    assert response.status_code == 200
+    mock_verify.assert_called_once()
+
+    verified_payment = mock_verify.call_args.kwargs["payment"]
+    assert verified_payment.tx_ref == payment.tx_ref
+
+
+@mock.patch("apps.payments.views.services.verify_transaction_with_chapa")
+def test_payment_verification_endpoint_rejects_another_visitors_booking(
+    mock_verify,
+):
+    payment = _make_payment()
+    other_visitor = _make_visitor(email="other-visitor@example.com")
+
+    client = APIClient()
+    client.force_authenticate(user=other_visitor)
+
+    response = client.post(
+        f"/api/v1/payments/bookings/{payment.booking.id}/verify/",
+        data={},
+        format="json",
+    )
+
+    assert response.status_code == 404
+    mock_verify.assert_not_called()
+
+def test_mobile_return_bridge_redirects_to_app_deep_link(settings):
+    settings.MOBILE_APP_DEEP_LINK = "frontend://payment-return"
+    booking_id = "11111111-1111-1111-1111-111111111111"
+
+    response = APIClient().get(f"/api/v1/payments/mobile-return/{booking_id}/")
+
+    assert response.status_code == 302
+    assert response["Location"] == f"frontend://payment-return/{booking_id}"

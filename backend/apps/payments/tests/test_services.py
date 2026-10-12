@@ -422,6 +422,93 @@ def test_verify_webhook_signature_rejects_when_secret_unconfigured(settings):
 
 
 # --------------------------------------------------------------------------
+# missed-webhook transaction reconciliation
+# --------------------------------------------------------------------------
+
+
+@mock.patch("apps.notifications.tasks.send_notification.delay")
+@mock.patch("apps.payments.tasks.render_and_store_receipt.delay")
+@mock.patch("apps.payments.services.requests.get")
+@mock.patch("apps.payments.services._initialize_chapa_checkout", return_value=FAKE_CHECKOUT_URL)
+def test_verify_transaction_with_chapa_confirms_matching_existing_payment(
+    mock_init, mock_get, mock_render, mock_notify
+):
+    booking = _make_booking()
+    payment = services.create_checkout_session(booking=booking)
+    mock_get.return_value = mock.Mock(
+        ok=True,
+        json=lambda: {
+            "status": "success",
+            "data": {
+                "tx_ref": payment.tx_ref,
+                "status": "success",
+                "amount": "200.00",
+                "currency": "ETB",
+            },
+        },
+    )
+
+    result = services.verify_transaction_with_chapa(payment=payment)
+
+    booking.refresh_from_db()
+    assert result.status == Payment.Status.COMPLETED
+    assert booking.status == Booking.Status.PENDING
+    mock_get.assert_called_once()
+
+
+@mock.patch("apps.payments.services.requests.get")
+@mock.patch("apps.payments.services._initialize_chapa_checkout", return_value=FAKE_CHECKOUT_URL)
+def test_verify_transaction_with_chapa_preserves_pending_payment(mock_init, mock_get):
+    booking = _make_booking()
+    payment = services.create_checkout_session(booking=booking)
+    mock_get.return_value = mock.Mock(
+        ok=True,
+        json=lambda: {
+            "status": "success",
+            "data": {
+                "tx_ref": payment.tx_ref,
+                "status": "pending",
+                "amount": "200.00",
+                "currency": "ETB",
+            },
+        },
+    )
+
+    result = services.verify_transaction_with_chapa(payment=payment)
+
+    booking.refresh_from_db()
+    result.refresh_from_db()
+    assert result.status == Payment.Status.INITIATED
+    assert booking.status == Booking.Status.AWAITING_PAYMENT
+    assert result.confirmed_at is None
+
+
+@mock.patch("apps.payments.services.requests.get")
+@mock.patch("apps.payments.services._initialize_chapa_checkout", return_value=FAKE_CHECKOUT_URL)
+def test_verify_transaction_with_chapa_rejects_amount_mismatch(mock_init, mock_get):
+    booking = _make_booking()
+    payment = services.create_checkout_session(booking=booking)
+    mock_get.return_value = mock.Mock(
+        ok=True,
+        json=lambda: {
+            "status": "success",
+            "data": {
+                "tx_ref": payment.tx_ref,
+                "status": "success",
+                "amount": "999.00",
+                "currency": "ETB",
+            },
+        },
+    )
+
+    with pytest.raises(ValidationError):
+        services.verify_transaction_with_chapa(payment=payment)
+
+    booking.refresh_from_db()
+    assert booking.status == Booking.Status.AWAITING_PAYMENT
+
+
+# --------------------------------------------------------------------------
 # confirm_payment_from_webhook (FR-PAY-002, FR-PAY-004)
 # --------------------------------------------------------------------------
 
@@ -494,3 +581,24 @@ def test_confirm_payment_from_webhook_rejects_unknown_tx_ref():
 def test_confirm_payment_from_webhook_requires_tx_ref():
     with pytest.raises(ValidationError):
         services.confirm_payment_from_webhook(payload={"status": "success"})
+
+
+@mock.patch("apps.payments.services.requests.get")
+@mock.patch("apps.payments.services._initialize_chapa_checkout", return_value=FAKE_CHECKOUT_URL)
+def test_verify_transaction_with_chapa_never_marks_failed(mock_init, mock_get):
+    booking = _make_booking()
+    payment = services.create_checkout_session(booking=booking)
+    mock_get.return_value = mock.Mock(
+        ok=True,
+        json=lambda: {
+            "status": "success",
+            "data": {"tx_ref": payment.tx_ref, "status": "failed", "amount": "200.00", "currency": "ETB"},
+        },
+    )
+
+    services.verify_transaction_with_chapa(payment=payment)
+
+    payment.refresh_from_db()
+    booking.refresh_from_db()
+    assert payment.status == Payment.Status.INITIATED
+    assert booking.status == Booking.Status.AWAITING_PAYMENT

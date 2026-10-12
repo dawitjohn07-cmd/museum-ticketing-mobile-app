@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, AppState, Modal, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as WebBrowser from 'expo-web-browser';
+import * as Linking from 'expo-linking';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  cancelBooking, getBooking, getCategories, getMyRefunds, requestPartialRefund, rescheduleBooking, updateBooking,
+  cancelBooking, getBooking, getCategories, getMyRefunds, requestPartialRefund, rescheduleBooking, updateBooking, verifyBookingPayment,
   type Booking,
 } from '../../../src/lib/api/services';
 import { ApiError, getApiErrorMessageForDisplay } from '../../../src/lib/api/client';
@@ -19,6 +20,10 @@ import { formatDate, formatDateTime } from '../../../src/lib/dates';
 import { colors, radii, shadows } from '../../../src/theme';
 
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+// Ask the server to verify with Chapa; if that call fails, fall back to a plain read.
+const reconcile = async (bookingId: string) => {
+  try { return await verifyBookingPayment(bookingId); } catch { return getBooking(bookingId); }
+};
 
 function Sheet({ visible, onClose, title, children }: { visible: boolean; onClose: () => void; title: string; children: React.ReactNode }) {
   return (
@@ -74,7 +79,7 @@ export default function BookingDetailScreen() {
     try {
       let latest: Booking | undefined;
       for (let i = 0; i < 8; i += 1) {
-        latest = await getBooking(id);
+        latest = await reconcile(id);
         qc.setQueryData(['booking', id], latest);
         if (latest.status !== 'awaiting_payment') break;
         await wait(2500);
@@ -95,19 +100,21 @@ export default function BookingDetailScreen() {
   // Returning to the app/tab after paying elsewhere: refresh once.
   useEffect(() => {
     const sub = AppState.addEventListener('change', (st) => {
-      if (st === 'active' && q.data?.status === 'awaiting_payment' && !polling.current) q.refetch();
+      if (st === 'active' && q.data?.status === 'awaiting_payment' && !polling.current) void pollPayment();
     });
     return () => sub.remove();
-  }, [q]);
+  }, [q, pollPayment]);
 
   const openCheckout = async () => {
     if (!booking?.checkoutUrl) return;
     if (Platform.OS === 'web') {
-      window.open(booking.checkoutUrl, '_blank');
-      setNotice({ text: t('payment_check_pending'), kind: 'info' });
+      // Same tab: Chapa returns to <web>/payment-return/<id>, which verifies the payment.
+      window.location.assign(booking.checkoutUrl);
       return;
     }
-    await WebBrowser.openBrowserAsync(booking.checkoutUrl);
+    // Native: an auth session closes itself when Chapa returns to the app link; whatever
+    // the outcome (success, cancel, dismissed) we then verify with the server.
+    await WebBrowser.openAuthSessionAsync(booking.checkoutUrl, Linking.createURL('payment-return'));
     void pollPayment();
   };
   const openReceipt = async () => {

@@ -2,6 +2,7 @@
  * Visitor API layer. Every call matches contracts/openapi.yaml of the website
  * backend (unchanged). Staff / manager / admin endpoints are intentionally absent.
  */
+import { Platform } from 'react-native';
 import { apiClient, BOOKING_CREATE_TIMEOUT_MS } from './client';
 
 export type Locale = 'en' | 'am';
@@ -61,8 +62,20 @@ export interface CreateBookingInput {
   visitDate: string; items: ItemInput[]; bookingType: BookingType;
   groupName?: string; groupTin?: string; groupContactPhone?: string | null;
 }
+// Tells the backend where Chapa should send the visitor after paying:
+// 'mobile_native' -> back into the app, 'mobile_web' -> Expo web route.
+// (Omitted by the website, which keeps its own return URL.)
+export type PaymentReturnTarget = 'mobile_native' | 'mobile_web';
 export const createBooking = (input: CreateBookingInput) =>
-  apiClient.post<Booking>('/bookings/', input, BOOKING_CREATE_TIMEOUT_MS);
+  apiClient.post<Booking>(
+    '/bookings/',
+    { ...input, paymentReturnTarget: Platform.OS === 'web' ? 'mobile_web' : 'mobile_native' },
+    BOOKING_CREATE_TIMEOUT_MS
+  );
+// Server-side check with Chapa (never trusts the redirect). Returns the booking.
+export const verifyBookingPayment = (bookingId: string) =>
+  apiClient.post<Booking>(`/payments/bookings/${bookingId}/verify/`);
+
 export const getBooking = (id: string) => apiClient.get<Booking>(`/bookings/${id}/`);
 export const getMyBookings = (p?: { limit?: number; offset?: number }) => {
   const q = new URLSearchParams();
