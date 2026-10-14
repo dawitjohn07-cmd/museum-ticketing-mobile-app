@@ -699,5 +699,14 @@
   "select_ticket_category": "ቢያንስ አንድ ትኬት ይጨምሩ።",
   "select_date_required": "የጉብኝት ቀን ይምረጡ።",
   "booking_check_timeout": "አገልጋዩ ዘግይቷል። አዲስ ቦታ ማስያዝ አልተገኘም፤ እንደገና ከመሞከርዎ በፊት የእኔ ቦታ ማስያዣዎችን ይመልከቱ።",
-  "payment_check_pending": "ክፍያ ገና አልተረጋገጠም። ከከፈሉ፣ ከጥቂት ጊዜ በኋላ እንደገና ይፈትሹ።"
+  "payment_check_pending": "ክፍያ ገና አልተረጋገጠም። ከከፈሉ፣ ከጥቂት ጊዜ በኋላ እንደገና ይፈትሹ።",
+  "home_hero_title": "የኢትዮጵያ ሕያው ማህደር።",
+  "enter_collection": "ስብስቡን ይግቡ",
+  "natural_history_addis": "የተፈጥሮ ታሪክ · አዲስ አበባ",
+  "home_hours_value": "ሰኞ–ቅዳሜ · 8:30–5:00",
+  "home_location_line1": "አአዩ አራት ኪሎ ግቢ",
+  "home_location_line2": "የሳይንስ ፋኩልቲ",
+  "passwordless_sign_in": "ያለ የይለፍ ቃል ይግቡ",
+  "meet_wild_heart": "የኢትዮጵያን የዱር ልብ ይተዋወቁ።",
+  "your_profile": "የእርስዎ መገለጫ"
 }

@@ -1,8 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, AppState, Modal, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, AppState, Platform, StyleSheet, Text, View } from 'react-native';
 import * as WebBrowser from 'expo-web-browser';
 import * as Linking from 'expo-linking';
-import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -12,12 +11,13 @@ import {
 import { ApiError, getApiErrorMessageForDisplay } from '../../../src/lib/api/client';
 import { useRequireAuth } from '../../../src/hooks/useAuth';
 import { useTranslation } from '../../../src/lib/i18n/useTranslation';
+import { useTheme } from '../../../src/lib/theme/useTheme';
 import { CategoryPicker, itemsFrom } from '../../../src/components/CategoryPicker';
 import { MonthCalendar } from '../../../src/components/MonthCalendar';
 import { DigitalTicket } from '../../../src/components/DigitalTicket';
-import { Banner, Button, StatusBadge } from '../../../src/components/ui';
+import { Banner, Body, BrandHeader, Button, Card, Heading, Kicker, Screen, Sheet, StatusBadge } from '../../../src/components/ui';
 import { formatDate, formatDateTime } from '../../../src/lib/dates';
-import { colors, radii, shadows } from '../../../src/theme';
+import { fonts } from '../../../src/theme';
 
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 // Ask the server to verify with Chapa; if that call fails, fall back to a plain read.
@@ -25,24 +25,12 @@ const reconcile = async (bookingId: string) => {
   try { return await verifyBookingPayment(bookingId); } catch { return getBooking(bookingId); }
 };
 
-function Sheet({ visible, onClose, title, children }: { visible: boolean; onClose: () => void; title: string; children: React.ReactNode }) {
-  return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <View style={s.backdrop}>
-        <View style={s.sheet}>
-          <Text style={s.sheetTitle}>{title}</Text>
-          <ScrollView keyboardShouldPersistTaps="handled">{children}</ScrollView>
-        </View>
-      </View>
-    </Modal>
-  );
-}
-
 export default function BookingDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const qc = useQueryClient();
   const { t, locale } = useTranslation();
+  const { colors } = useTheme();
   const { isAuthenticated, isLoading: authLoading } = useRequireAuth();
 
   const [notice, setNotice] = useState<{ text: string; kind: 'error' | 'info' | 'success' } | null>(null);
@@ -147,14 +135,16 @@ export default function BookingDetailScreen() {
     },
   });
 
-  if (authLoading || !isAuthenticated || q.isLoading) return <View style={s.center}><ActivityIndicator size="large" color={colors.forestBright} /></View>;
+  if (authLoading || !isAuthenticated || q.isLoading) {
+    return <Screen scroll={false}><View style={s.center}><ActivityIndicator size="large" color={colors.lime} /></View></Screen>;
+  }
   if (q.isError || !booking) {
     return (
-      <View style={s.center}>
-        <Text style={s.h2}>{t('booking_not_found')}</Text>
-        <Text style={s.muted}>{q.error ? getApiErrorMessageForDisplay(q.error) : t('booking_not_found_description')}</Text>
+      <Screen stickyHeader={<BrandHeader onBack={() => router.replace('/(visitor)/bookings' as never)} />}>
+        <Heading size={34}>{t('booking_not_found')}</Heading>
+        <Body style={{ marginBottom: 12 }}>{q.error ? getApiErrorMessageForDisplay(q.error) : t('booking_not_found_description')}</Body>
         <Button label={t('back_to_bookings')} onPress={() => router.replace('/(visitor)/bookings' as never)} />
-      </View>
+      </Screen>
     );
   }
 
@@ -173,136 +163,125 @@ export default function BookingDetailScreen() {
   };
 
   return (
-    <SafeAreaView style={s.container} edges={['bottom']}>
-      <ScrollView contentContainerStyle={s.scroll}>
-        <Button label={`← ${t('back_to_bookings')}`} variant="secondary" onPress={() => router.replace('/(visitor)/bookings' as never)} />
-        <View style={s.head}>
-          <View style={{ flex: 1 }}>
-            <Text style={s.h1}>{t('booking_details')}</Text>
-            <Text style={s.ref}>#{booking.reference}</Text>
-          </View>
-          <StatusBadge status={booking.status} />
+    <Screen stickyHeader={<><BrandHeader onBack={() => router.replace('/(visitor)/bookings' as never)} /><Kicker>ARCHIVE / TICKET</Kicker></>}>
+      <View style={s.head}>
+        <View style={{ flex: 1 }}>
+          <Heading size={38} style={{ marginBottom: 2 }}>{t('booking_details')}</Heading>
+          <Text style={[s.ref, { color: colors.lime }]}>#{booking.reference}</Text>
         </View>
+        <StatusBadge status={booking.status} />
+      </View>
 
-        {notice ? <Banner text={notice.text} kind={notice.kind} /> : null}
+      {notice ? <Banner text={notice.text} kind={notice.kind} /> : null}
 
-        <View style={s.card}>
-          <Row k={t('visit_date')} v={formatDate(booking.visitDate, locale)} />
-          {booking.bookingType === 'group' && booking.groupName ? <Row k={t('group_name')} v={booking.groupName} /> : null}
-          <Row k={t('category')} v={summary} />
-          <Row k={t('quantity')} v={String(booking.bookedQuantity)} />
-          <Row k={t('total')} v={`ETB ${booking.totalAmountEtb}`} strong />
-          {booking.attendedQuantity !== null && booking.attendedQuantity !== undefined ? <Row k={t('attended')} v={String(booking.attendedQuantity)} /> : null}
-          <Row k={t('booked_on')} v={formatDateTime(booking.createdAt, locale)} />
-          {showReceipt ? <Button label={t('download_receipt')} variant="secondary" onPress={openReceipt} /> : null}
-        </View>
+      <Card>
+        <Row k={t('visit_date')} v={formatDate(booking.visitDate, locale)} />
+        {booking.bookingType === 'group' && booking.groupName ? <Row k={t('group_name')} v={booking.groupName} /> : null}
+        <Row k={t('category')} v={summary} />
+        <Row k={t('quantity')} v={String(booking.bookedQuantity)} />
+        <Row k={t('total')} v={`ETB ${booking.totalAmountEtb}`} strong />
+        {booking.attendedQuantity !== null && booking.attendedQuantity !== undefined ? <Row k={t('attended')} v={String(booking.attendedQuantity)} /> : null}
+        <Row k={t('booked_on')} v={formatDateTime(booking.createdAt, locale)} />
+        {showReceipt ? <Button label={t('download_receipt')} variant="secondary" onPress={openReceipt} /> : null}
+      </Card>
 
-        {isAwaiting && (
-          <View style={[s.card, { backgroundColor: '#EEF7F0' }]}>
-            <Text style={s.h2}>{t('payment_required')}</Text>
-            <Text style={s.muted}>{booking.categoryCorrectedAt ? t('payment_required_correction_description') : t('payment_required_description')}</Text>
-            {booking.checkoutUrl ? (
-              <Button label={checking ? t('processing') : t('pay_now')} loading={checking} onPress={openCheckout} />
-            ) : (
-              <Text style={[s.muted, { color: colors.danger }]}>{t('checkout_unavailable')}</Text>
-            )}
-            {Platform.OS === 'web' || notice?.kind === 'info' ? <Button label={t('check_again')} variant="secondary" onPress={pollPayment} disabled={checking} /> : null}
-            <Button label={t('edit_booking')} variant="secondary" onPress={openEdit} />
-            <Button label={t('delete_booking')} variant="danger" onPress={() => setConfirm('cancel')} />
-          </View>
-        )}
-
-        {isPending && (
-          <DigitalTicket reference={booking.reference} dateLabel={formatDate(booking.visitDate, locale)} summary={summary} />
-        )}
-
-        {shortfall && (
-          <View style={[s.card, { backgroundColor: '#FFF3E0' }]}>
-            <Text style={s.h2}>{t('partial_attendance_recorded')}</Text>
-            <Text style={s.muted}>
-              {booking.bookedQuantity - (booking.attendedQuantity ?? 0)} / {booking.bookedQuantity}
-              {booking.status === 'visited' ? `\n${t('refund_available')}` : ''}
-            </Text>
-            {booking.status === 'visited' ? (
-              refundRow || refund.isSuccess ? <Text style={[s.muted, { fontWeight: '800' }]}>✓ {t('refund_requested')}</Text>
-                : <Button label={t('request_refund')} loading={refund.isPending} onPress={() => refund.mutate()} />
-            ) : null}
-          </View>
-        )}
-
-        {(booking.status === 'cancelled' || booking.status === 'refunded') && (
-          <View style={s.card}>
-            <Text style={s.h2}>{t('cancellation')}</Text>
-            <Text style={s.muted}>
-              {!cancelRefund ? t('no_refund_record') : cancelRefund.status === 'completed' ? t('refund_completed') : cancelRefund.status === 'failed' ? t('refund_failed') : t('refund_processing')}
-            </Text>
-          </View>
-        )}
-
-        <View style={s.card}>
-          <Text style={s.h2}>{t('manage_booking')}</Text>
-          {isPending ? (
-            <>
-              <Text style={s.muted}>{t('manage_booking_description')}</Text>
-              {canReschedule ? <Button label={t('reschedule')} variant="secondary" onPress={() => { setNewDate(''); setReschedOpen(true); }} /> : <Text style={s.muted}>{t('max_reschedule_reached')}</Text>}
-              <Button label={t('cancel_booking')} variant="danger" onPress={() => setConfirm('cancel')} />
-            </>
+      {isAwaiting && (
+        <Card style={{ borderColor: colors.lime }}>
+          <Text style={[s.h2, { color: colors.text }]}>{t('payment_required')}</Text>
+          <Body>{booking.categoryCorrectedAt ? t('payment_required_correction_description') : t('payment_required_description')}</Body>
+          {booking.checkoutUrl ? (
+            <Button label={checking ? t('processing') : t('pay_now')} loading={checking} onPress={openCheckout} />
           ) : (
-            <Text style={s.muted}>
-              {booking.status === 'visited' ? t('already_visited') : booking.status === 'cancelled' ? t('already_cancelled') : booking.status === 'refunded' ? t('already_refunded') : t('awaiting_payment_message')}
-            </Text>
+            <Text style={{ color: colors.danger, marginTop: 8 }}>{t('checkout_unavailable')}</Text>
           )}
-        </View>
-      </ScrollView>
+          {Platform.OS === 'web' || notice?.kind === 'info' ? <Button label={t('check_again')} variant="secondary" onPress={pollPayment} disabled={checking} /> : null}
+          <Button label={t('edit_booking')} variant="ghost" onPress={openEdit} />
+          <Button label={t('delete_booking')} variant="danger" onPress={() => setConfirm('cancel')} />
+        </Card>
+      )}
+
+      {isPending && (
+        <DigitalTicket reference={booking.reference} dateLabel={formatDate(booking.visitDate, locale)} summary={summary} />
+      )}
+
+      {shortfall && (
+        <Card style={{ borderColor: colors.warn }}>
+          <Text style={[s.h2, { color: colors.text }]}>{t('partial_attendance_recorded')}</Text>
+          <Body>
+            {booking.bookedQuantity - (booking.attendedQuantity ?? 0)} / {booking.bookedQuantity}
+            {booking.status === 'visited' ? `\n${t('refund_available')}` : ''}
+          </Body>
+          {booking.status === 'visited' ? (
+            refundRow || refund.isSuccess ? <Text style={{ color: colors.lime, fontWeight: '800', marginTop: 8 }}>✓ {t('refund_requested')}</Text>
+              : <Button label={t('request_refund')} loading={refund.isPending} onPress={() => refund.mutate()} />
+          ) : null}
+        </Card>
+      )}
+
+      {(booking.status === 'cancelled' || booking.status === 'refunded') && (
+        <Card>
+          <Text style={[s.h2, { color: colors.text }]}>{t('cancellation')}</Text>
+          <Body>
+            {!cancelRefund ? t('no_refund_record') : cancelRefund.status === 'completed' ? t('refund_completed') : cancelRefund.status === 'failed' ? t('refund_failed') : t('refund_processing')}
+          </Body>
+        </Card>
+      )}
+
+      <Card>
+        <Text style={[s.h2, { color: colors.text }]}>{t('manage_booking')}</Text>
+        {isPending ? (
+          <>
+            <Body>{t('manage_booking_description')}</Body>
+            {canReschedule ? <Button label={t('reschedule')} variant="secondary" onPress={() => { setNewDate(''); setReschedOpen(true); }} /> : <Body style={{ marginTop: 8 }}>{t('max_reschedule_reached')}</Body>}
+            <Button label={t('cancel_booking')} variant="danger" onPress={() => setConfirm('cancel')} />
+          </>
+        ) : (
+          <Body>
+            {booking.status === 'visited' ? t('already_visited') : booking.status === 'cancelled' ? t('already_cancelled') : booking.status === 'refunded' ? t('already_refunded') : t('awaiting_payment_message')}
+          </Body>
+        )}
+      </Card>
 
       <Sheet visible={confirm === 'cancel'} onClose={() => setConfirm(null)} title={isPending ? t('cancel_booking') : t('delete_booking')}>
-        <Text style={s.muted}>{isPending ? t('cancel_confirmation') : t('delete_unpaid_booking_confirmation')}</Text>
+        <Body>{isPending ? t('cancel_confirmation') : t('delete_unpaid_booking_confirmation')}</Body>
         <Button label={isPending ? t('cancel_booking') : t('delete_booking')} variant="danger" loading={cancel.isPending} onPress={() => { setConfirm(null); cancel.mutate(); }} />
-        <Button label={t('back')} variant="secondary" onPress={() => setConfirm(null)} />
+        <Button label={t('back')} variant="ghost" onPress={() => setConfirm(null)} />
       </Sheet>
 
       <Sheet visible={reschedOpen} onClose={() => setReschedOpen(false)} title={t('reschedule_booking')}>
-        <Text style={s.muted}>{t('current_date')}: {formatDate(booking.visitDate, locale)}</Text>
+        <Body style={{ marginBottom: 10 }}>{t('current_date')}: {formatDate(booking.visitDate, locale)}</Body>
         <MonthCalendar value={newDate} onChange={setNewDate} />
-        <Text style={s.muted}>{t('reschedule_note')}</Text>
+        <Body>{t('reschedule_note')}</Body>
         <Button label={t('confirm')} disabled={!newDate} loading={reschedule.isPending} onPress={() => reschedule.mutate()} />
-        <Button label={t('cancel')} variant="secondary" onPress={() => setReschedOpen(false)} />
+        <Button label={t('cancel')} variant="ghost" onPress={() => setReschedOpen(false)} />
       </Sheet>
 
       <Sheet visible={editOpen} onClose={() => setEditOpen(false)} title={t('edit_booking')}>
         <MonthCalendar value={editDate} onChange={setEditDate} />
-        <View style={{ height: 12 }} />
-        {cats.isLoading ? <ActivityIndicator color={colors.forestBright} /> : <CategoryPicker categories={cats.data ?? []} quantities={editQty} onChange={setEditQty} />}
+        {cats.isLoading ? <ActivityIndicator color={colors.lime} /> : <CategoryPicker categories={cats.data ?? []} quantities={editQty} onChange={setEditQty} />}
         <Button label={t('save_changes')} disabled={Object.keys(editQty).length === 0 || !editDate} loading={save.isPending} onPress={() => save.mutate()} />
-        <Button label={t('cancel')} variant="secondary" onPress={() => setEditOpen(false)} />
+        <Button label={t('cancel')} variant="ghost" onPress={() => setEditOpen(false)} />
       </Sheet>
-    </SafeAreaView>
+    </Screen>
   );
 }
 
 function Row({ k, v, strong }: { k: string; v: string; strong?: boolean }) {
+  const { colors } = useTheme();
   return (
     <View style={s.row}>
-      <Text style={s.k}>{k}</Text>
-      <Text style={[s.v, strong && { fontWeight: '900', fontSize: 17 }]}>{v}</Text>
+      <Text style={[s.k, { color: colors.muted }]}>{k}</Text>
+      <Text style={[s.v, { color: strong ? colors.lime : colors.text }, strong && { fontWeight: '900', fontSize: 18 }]}>{v}</Text>
     </View>
   );
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.cream },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
-  scroll: { padding: 16, paddingBottom: 48 },
-  head: { flexDirection: 'row', alignItems: 'center', gap: 12, marginVertical: 14 },
-  h1: { fontSize: 24, fontWeight: '900', color: colors.ink },
-  h2: { fontSize: 17, fontWeight: '900', color: colors.ink, marginBottom: 6 },
-  ref: { color: colors.inkSoft, marginTop: 2, fontWeight: '700' },
-  muted: { color: colors.inkSoft, lineHeight: 21, marginVertical: 6 },
-  card: { backgroundColor: '#fff', borderRadius: radii.md, padding: 16, marginBottom: 14, ...shadows.card },
-  row: { flexDirection: 'row', justifyContent: 'space-between', gap: 12, paddingVertical: 6 },
-  k: { color: colors.inkSoft },
-  v: { color: colors.ink, fontWeight: '700', flex: 1, textAlign: 'right' },
-  backdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end' },
-  sheet: { backgroundColor: colors.cream, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 18, maxHeight: '90%' },
-  sheetTitle: { fontSize: 20, fontWeight: '900', color: colors.ink, marginBottom: 10 },
+  head: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 16 },
+  h2: { fontFamily: fonts.serif, fontSize: 24, marginBottom: 6 },
+  ref: { fontWeight: '800', letterSpacing: 1 },
+  row: { flexDirection: 'row', justifyContent: 'space-between', gap: 12, paddingVertical: 7 },
+  k: {},
+  v: { fontWeight: '700', flex: 1, textAlign: 'right' },
 });

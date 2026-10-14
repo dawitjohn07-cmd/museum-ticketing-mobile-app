@@ -8,9 +8,10 @@ import { getMyBookings, getMyRefunds, type Booking } from '../../src/lib/api/ser
 import { getApiErrorMessageForDisplay } from '../../src/lib/api/client';
 import { useRequireAuth } from '../../src/hooks/useAuth';
 import { useTranslation } from '../../src/lib/i18n/useTranslation';
-import { Banner, Button, StatusBadge } from '../../src/components/ui';
+import { Banner, Body, BrandHeader, Button, Chip, Glow, Heading, Kicker, StatusBadge } from '../../src/components/ui';
+import { useTheme } from '../../src/lib/theme/useTheme';
 import { formatDate } from '../../src/lib/dates';
-import { colors, radii, shadows } from '../../src/theme';
+import { fonts, radii } from '../../src/theme';
 
 type Filter = 'all' | 'pending' | 'visited' | 'cancelled';
 const PAGE = 20;
@@ -19,6 +20,7 @@ export default function MyBookingsScreen() {
   const router = useRouter();
   const { t, locale } = useTranslation();
   const { isAuthenticated, isLoading: authLoading } = useRequireAuth();
+  const { colors } = useTheme();
   const [filter, setFilter] = useState<Filter>('all');
 
   const q = useInfiniteQuery({
@@ -37,85 +39,99 @@ export default function MyBookingsScreen() {
     filter === 'cancelled' ? b.status === 'cancelled' || b.status === 'refunded' :
     b.status === filter);
 
-  if (authLoading || !isAuthenticated) return <View style={s.center}><ActivityIndicator color={colors.forestBright} /></View>;
+  const bg = (child: React.ReactNode) => (
+    <View style={{ flex: 1, backgroundColor: colors.bg }}>
+      <Glow />
+      <SafeAreaView style={{ flex: 1 }} edges={['top']}>
+        <View style={{ paddingHorizontal: 24, paddingTop: 4 }}><BrandHeader /></View>
+        {child}
+      </SafeAreaView>
+    </View>
+  );
+
+  if (authLoading || !isAuthenticated) return bg(<View style={s.center}><ActivityIndicator color={colors.lime} /></View>);
 
   const chips: { key: Filter; label: string }[] = [
     { key: 'all', label: t('all') }, { key: 'pending', label: t('upcoming') },
     { key: 'visited', label: t('visited') }, { key: 'cancelled', label: t('cancelled') },
   ];
 
+  const header = (
+    <View>
+      <Kicker>ARCHIVE ID / BOOKINGS</Kicker>
+      <Heading size={48}>{t('my_bookings')}</Heading>
+      <View style={s.chips}>{chips.map((c) => (<Chip key={c.key} label={c.label} active={filter === c.key} onPress={() => setFilter(c.key)} />))}</View>
+    </View>
+  );
+
   const renderItem = ({ item: b }: { item: Booking }) => {
     const refund = refundByBooking.get(b.id);
     return (
-      <Pressable style={({ pressed }) => [s.card, pressed && { opacity: 0.85 }]} onPress={() => router.push(`/(visitor)/booking/${b.id}` as never)}>
-        <View style={s.cardHead}><StatusBadge status={b.status} /><ChevronRight size={20} color="#BDBDBD" /></View>
-        <Text style={s.ref}>{b.reference}{b.bookingType === 'group' && b.groupName ? ` · ${b.groupName}` : ''}</Text>
-        <Text style={s.date}>{formatDate(b.visitDate, locale)}</Text>
+      <Pressable
+        style={({ pressed }) => [
+          s.card,
+          { backgroundColor: colors.card, borderColor: colors.line },
+          pressed && { opacity: 0.85 },
+        ]}
+        onPress={() => router.push(`/(visitor)/booking/${b.id}` as never)}
+      >
+        <View style={s.cardHead}><StatusBadge status={b.status} /><ChevronRight size={20} color={colors.lime} /></View>
+        <Text style={[s.ref, { color: colors.text }]}>{b.reference}{b.bookingType === 'group' && b.groupName ? ` · ${b.groupName}` : ''}</Text>
+        <Text style={[s.date, { color: colors.muted }]}>{formatDate(b.visitDate, locale)}</Text>
         {b.status === 'cancelled' && (
-          <Text style={s.refund}>
+          <Text style={[s.refund, { color: colors.muted }]}>
             {!refund ? t('no_refund_record') : refund.status === 'completed' ? t('refund_completed') : refund.status === 'failed' ? t('refund_failed') : t('refund_processing')}
           </Text>
         )}
-        <View style={s.divider} />
+        <View style={[s.divider, { backgroundColor: colors.line }]} />
         <View style={s.foot}>
-          <Text style={s.items} numberOfLines={2}>
+          <Text style={[s.items, { color: colors.muted }]} numberOfLines={2}>
             {b.items.map((i) => `${locale === 'am' && i.categoryNameAm ? i.categoryNameAm : i.categoryNameEn} ×${i.quantity}`).join(', ')}
           </Text>
-          <Text style={s.total}>{b.totalAmountEtb} ETB</Text>
+          <Text style={[s.total, { color: colors.lime }]}>{b.totalAmountEtb} ETB</Text>
         </View>
       </Pressable>
     );
   };
 
-  return (
-    <SafeAreaView style={s.container} edges={['bottom']}>
-      <View style={s.chips}>
-        {chips.map((c) => (
-          <Pressable key={c.key} onPress={() => setFilter(c.key)} style={[s.chip, filter === c.key && s.chipOn]}>
-            <Text style={[s.chipText, filter === c.key && { color: '#fff' }]}>{c.label}</Text>
-          </Pressable>
-        ))}
+  return bg(
+    q.isLoading ? (
+      <View style={{ padding: 24 }}>{header}<ActivityIndicator size="large" color={colors.lime} style={{ marginTop: 30 }} /></View>
+    ) : q.isError ? (
+      <View style={{ padding: 24 }}>
+        {header}
+        <Banner text={getApiErrorMessageForDisplay(q.error) || t('failed_to_load_bookings')} />
+        <Button label={t('retry')} onPress={() => q.refetch()} />
       </View>
-      {q.isLoading ? <ActivityIndicator size="large" color={colors.forestBright} style={{ marginTop: 40 }} /> :
-        q.isError ? (
-          <View style={s.pad}>
-            <Banner text={getApiErrorMessageForDisplay(q.error) || t('failed_to_load_bookings')} />
-            <Button label={t('retry')} onPress={() => q.refetch()} />
-          </View>
-        ) : (
-          <FlatList
-            data={shown}
-            keyExtractor={(b) => b.id}
-            renderItem={renderItem}
-            contentContainerStyle={s.list}
-            refreshControl={<RefreshControl refreshing={q.isRefetching && !q.isFetchingNextPage} onRefresh={() => { q.refetch(); refunds.refetch(); }} tintColor={colors.forestBright} />}
-            ListEmptyComponent={<View style={s.empty}><Text style={s.emptyT}>{t('no_bookings_yet')}</Text><Text style={s.emptyS}>{t('book_visit_to_start')}</Text></View>}
-            ListFooterComponent={q.hasNextPage ? <Button label={t('load_more')} variant="secondary" loading={q.isFetchingNextPage} onPress={() => q.fetchNextPage()} /> : null}
-          />
-        )}
-    </SafeAreaView>
+    ) : (
+      <FlatList
+        data={shown}
+        keyExtractor={(b) => b.id}
+        renderItem={renderItem}
+        ListHeaderComponent={header}
+        contentContainerStyle={s.list}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={q.isRefetching && !q.isFetchingNextPage} onRefresh={() => { q.refetch(); refunds.refetch(); }} tintColor={colors.lime} />}
+        ListEmptyComponent={<View style={s.empty}><Text style={[s.emptyT, { color: colors.text }]}>{t('no_bookings_yet')}</Text><Body style={{ marginTop: 6, textAlign: 'center' }}>{t('book_visit_to_start')}</Body></View>}
+        ListFooterComponent={q.hasNextPage ? <Button label={t('load_more')} variant="secondary" loading={q.isFetchingNextPage} onPress={() => q.fetchNextPage()} /> : null}
+      />
+    )
   );
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.cream },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  pad: { padding: 20 },
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, padding: 16, paddingBottom: 4 },
-  chip: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: radii.pill, backgroundColor: colors.mist },
-  chipOn: { backgroundColor: colors.forestBright },
-  chipText: { fontWeight: '800', color: colors.forest },
-  list: { padding: 16, paddingBottom: 40 },
-  card: { backgroundColor: '#fff', borderRadius: radii.md, padding: 16, marginBottom: 12, ...shadows.card },
+  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 18 },
+  list: { padding: 24, paddingBottom: 40 },
+  card: { borderRadius: radii.md, borderWidth: 1, padding: 16, marginBottom: 14 },
   cardHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  ref: { fontSize: 18, fontWeight: '900', color: colors.ink, marginTop: 10 },
-  date: { color: colors.inkSoft, marginTop: 2 },
-  refund: { color: colors.inkSoft, marginTop: 4, fontSize: 13 },
-  divider: { height: 1, backgroundColor: colors.border, marginVertical: 12 },
+  ref: { fontFamily: fonts.serif, fontSize: 24, marginTop: 12 },
+  date: { marginTop: 2 },
+  refund: { marginTop: 4, fontSize: 13 },
+  divider: { height: 1, marginVertical: 12 },
   foot: { flexDirection: 'row', justifyContent: 'space-between', gap: 12 },
-  items: { flex: 1, color: colors.inkSoft },
-  total: { fontWeight: '900', color: colors.ink },
-  empty: { alignItems: 'center', marginTop: 60, padding: 20 },
-  emptyT: { fontWeight: '900', fontSize: 18, color: colors.ink },
-  emptyS: { color: colors.inkSoft, marginTop: 6, textAlign: 'center' },
+  items: { flex: 1 },
+  total: { fontWeight: '900' },
+  empty: { alignItems: 'center', marginTop: 40, padding: 20 },
+  emptyT: { fontFamily: fonts.serif, fontSize: 24 },
 });

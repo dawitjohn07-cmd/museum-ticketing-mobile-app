@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Text } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { getBooking, verifyBookingPayment } from '../../src/lib/api/services';
 import { useAuth } from '../../src/hooks/useAuth';
 import { useTranslation } from '../../src/lib/i18n/useTranslation';
-import { colors } from '../../src/theme';
+import { Centered, Screen } from '../../src/components/ui';
+import { colors, fonts } from '../../src/theme';
 
 // Landing route for Chapa's return (deep link frontend://payment-return/<id> or the
 // Expo-web URL). The redirect itself proves nothing: we ask the server to verify
@@ -45,13 +46,11 @@ export default function PaymentReturn() {
   }, [id, isAuthenticated, isLoading, qc, router, t]);
 
   return (
-    <View style={s.c}>
-      <ActivityIndicator size="large" color={colors.forestBright} />
-      <Text style={s.t}>{msg}</Text>
-    </View>
+    <Screen scroll={false}>
+      <Centered>
+        <ActivityIndicator size="large" color={colors.lime} />
+        <Text style={{ marginTop: 18, color: '#FFF', fontFamily: fonts.serif, fontSize: 22, textAlign: 'center' }}>{msg}</Text>
+      </Centered>
+    </Screen>
   );
 }
-const s = StyleSheet.create({
-  c: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24, backgroundColor: colors.cream },
-  t: { marginTop: 16, color: colors.ink, fontWeight: '700', textAlign: 'center' },
-});

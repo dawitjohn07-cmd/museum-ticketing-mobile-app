@@ -1,13 +1,15 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { useTranslation } from '../lib/i18n/useTranslation';
-import { colors, radii, shadows } from '../theme';
+import { CardArt } from './Art';
+import { colors, fonts } from '../theme';
 
 // Same as the website: the reference code is the ticket (no QR; gate staff look it up).
 export function DigitalTicket({ reference, dateLabel, summary }: { reference: string; dateLabel: string; summary: string }) {
   const { t } = useTranslation();
   return (
     <View style={s.card}>
+      <CardArt variant={3} />
       <Text style={s.kicker}>{t('digital_ticket')}</Text>
       <Text style={s.ref} selectable>{reference}</Text>
       <Text style={s.line}>{dateLabel}</Text>
@@ -17,9 +19,9 @@ export function DigitalTicket({ reference, dateLabel, summary }: { reference: st
   );
 }
 const s = StyleSheet.create({
-  card: { backgroundColor: colors.forest, borderRadius: radii.md, padding: 20, marginBottom: 16, ...shadows.card },
-  kicker: { color: colors.moss, fontWeight: '900', letterSpacing: 1.5, fontSize: 12 },
-  ref: { color: '#fff', fontSize: 30, fontWeight: '900', letterSpacing: 4, marginVertical: 10 },
-  line: { color: '#D6E9D4', marginTop: 2 },
-  hint: { color: colors.moss, marginTop: 12, fontSize: 13 },
+  card: { borderRadius: 28, overflow: 'hidden', padding: 22, marginBottom: 16, borderWidth: 1, borderColor: colors.lime },
+  kicker: { color: colors.lime, fontWeight: '900', letterSpacing: 2, fontSize: 12, textTransform: 'uppercase' },
+  ref: { color: '#fff', fontFamily: fonts.serif, fontSize: 34, letterSpacing: 4, marginVertical: 12 },
+  line: { color: 'rgba(255,255,255,0.88)', marginTop: 2 },
+  hint: { color: colors.lime, marginTop: 14, fontSize: 13, fontWeight: '700' },
 });

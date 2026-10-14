@@ -611,9 +611,9 @@
   "confirm_party_sub": "Your visit is booked. See you at the museum!",
   "hours": "Hours",
   "monday_saturday": "Mon - Sat",
-  "sunday_closed": "Sunday Closed",
+  "sunday_closed": "Sunday closed",
   "plan_your_visit": "Plan Your Visit",
-  "home_visit_description": "Discover the rich biodiversity of Ethiopia. Book your tickets online to guarantee your entry and avoid queues.",
+  "home_visit_description": "Discover the rich biodiversity of Ethiopia. Book your tickets online to guarantee entry and avoid queues.",
   "museum_description": "Established in 1955, the Zoological Natural History Museum at Addis Ababa University houses the most extensive collection of Ethiopian fauna in the world, including many endemic species of mammals, birds, reptiles, amphibians, and invertebrates.",
   "saved": "Saved",
   "error": "Error",
@@ -699,5 +699,14 @@
   "select_ticket_category": "Add at least one ticket.",
   "select_date_required": "Select a visit date.",
   "booking_check_timeout": "The server is slow. We found no new booking; please check My bookings before trying again.",
-  "payment_check_pending": "Payment not confirmed yet. If you have paid, check again in a moment."
+  "payment_check_pending": "Payment not confirmed yet. If you have paid, check again in a moment.",
+  "home_hero_title": "A living archive of Ethiopia.",
+  "enter_collection": "ENTER THE COLLECTION",
+  "natural_history_addis": "NATURAL HISTORY · ADDIS ABABA",
+  "home_hours_value": "Mon–Sat · 8:30 AM–5:00 PM",
+  "home_location_line1": "AAU Arat Kilo Campus",
+  "home_location_line2": "Science Faculty",
+  "passwordless_sign_in": "Passwordless sign in",
+  "meet_wild_heart": "Meet the wild heart of Ethiopia.",
+  "your_profile": "Your profile"
 }

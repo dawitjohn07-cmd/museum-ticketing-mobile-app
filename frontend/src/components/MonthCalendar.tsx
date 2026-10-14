@@ -5,12 +5,14 @@ import { ChevronLeft, ChevronRight } from 'lucide-react-native';
 import { getAvailabilityRange } from '../lib/api/services';
 import { parseIso, toIso, todayIso } from '../lib/dates';
 import { useTranslation } from '../lib/i18n/useTranslation';
-import { colors, radii } from '../theme';
+import { useTheme } from '../lib/theme/useTheme';
+import { fonts, radii } from '../theme';
 
 /** Month grid driven by GET /availability/?from&to. Past days, Sundays and
  *  Manager-closed dates are disabled (website AvailabilityDatePicker rules). */
 export function MonthCalendar({ value, onChange }: { value: string; onChange: (iso: string) => void }) {
   const { t, locale } = useTranslation();
+  const { colors } = useTheme();
   const now = new Date();
   const [view, setView] = useState(() => (value ? parseIso(value) : now));
   const year = view.getFullYear();
@@ -39,23 +41,36 @@ export function MonthCalendar({ value, onChange }: { value: string; onChange: (i
   const title = view.toLocaleDateString(locale === 'am' ? 'am-ET' : 'en-US', { month: 'long', year: 'numeric' });
 
   return (
-    <View style={s.wrap}>
+    <View style={[s.wrap, { backgroundColor: colors.card, borderColor: colors.line }]}>
       <View style={s.head}>
-        <Pressable accessibilityLabel={t('previous_month')} disabled={atCurrentMonth} onPress={() => setView(new Date(year, month - 1, 1))} style={[s.nav, atCurrentMonth && { opacity: 0.3 }]}>
-          <ChevronLeft color={colors.forest} size={22} />
+        <Pressable
+          accessibilityLabel={t('previous_month')}
+          disabled={atCurrentMonth}
+          onPress={() => setView(new Date(year, month - 1, 1))}
+          style={[s.nav, atCurrentMonth && { opacity: 0.3 }]}
+        >
+          <ChevronLeft color={colors.lime} size={22} />
         </Pressable>
-        <Text style={s.title}>{title}</Text>
-        <Pressable accessibilityLabel={t('next_month')} onPress={() => setView(new Date(year, month + 1, 1))} style={s.nav}>
-          <ChevronRight color={colors.forest} size={22} />
+        <Text style={[s.title, { color: colors.text }]}>{title}</Text>
+        <Pressable
+          accessibilityLabel={t('next_month')}
+          onPress={() => setView(new Date(year, month + 1, 1))}
+          style={s.nav}
+        >
+          <ChevronRight color={colors.lime} size={22} />
         </Pressable>
       </View>
       <View style={s.row}>
-        {weekdayNames.map((w, i) => (<Text key={i} style={s.wd}>{w}</Text>))}
+        {weekdayNames.map((w, i) => (
+          <Text key={i} style={[s.wd, { color: colors.lime }]}>{w}</Text>
+        ))}
       </View>
       {isLoading ? (
-        <ActivityIndicator color={colors.forestBright} style={{ marginVertical: 24 }} />
+        <ActivityIndicator color={colors.lime} style={{ marginVertical: 24 }} />
       ) : isError ? (
-        <Pressable onPress={() => refetch()}><Text style={s.err}>{t('failed_to_load_availability')} · {t('retry')}</Text></Pressable>
+        <Pressable onPress={() => refetch()}>
+          <Text style={[s.err, { color: colors.danger }]}>{t('failed_to_load_availability')} · {t('retry')}</Text>
+        </Pressable>
       ) : (
         <View style={s.grid}>
           {days.map((d, i) => {
@@ -65,9 +80,22 @@ export function MonthCalendar({ value, onChange }: { value: string; onChange: (i
             const disabled = iso < today || closed;
             const selected = iso === value;
             return (
-              <Pressable key={iso} disabled={disabled} onPress={() => onChange(iso)} style={s.cell} accessibilityState={{ disabled, selected }}>
-                <View style={[s.day, selected && { backgroundColor: colors.forestBright }]}>
-                  <Text style={[s.dayText, disabled && { color: '#B8C2BB', textDecorationLine: closed && iso >= today ? 'line-through' : 'none' }, selected && { color: '#fff' }]}>
+              <Pressable
+                key={iso}
+                disabled={disabled}
+                onPress={() => onChange(iso)}
+                style={s.cell}
+                accessibilityState={{ disabled, selected }}
+              >
+                <View style={[s.day, selected && { backgroundColor: colors.lime }]}>
+                  <Text
+                    style={[
+                      s.dayText,
+                      { color: colors.text },
+                      disabled && { color: colors.faint, textDecorationLine: closed && iso >= today ? 'line-through' : 'none', opacity: 0.5 },
+                      selected && { color: colors.limeDark },
+                    ]}
+                  >
                     {d.getDate()}
                   </Text>
                 </View>
@@ -76,22 +104,51 @@ export function MonthCalendar({ value, onChange }: { value: string; onChange: (i
           })}
         </View>
       )}
-      <Text style={s.legend}>{t('closed_every_sunday')}</Text>
+      <Text style={[s.legend, { color: colors.muted }]}>{t('closed_every_sunday')}</Text>
     </View>
   );
 }
 
 const s = StyleSheet.create({
-  wrap: { backgroundColor: '#fff', borderRadius: radii.md, borderWidth: 1, borderColor: colors.border, padding: 10 },
-  head: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
-  nav: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
-  title: { fontWeight: '800', color: colors.ink, fontSize: 16 },
+  wrap: {
+    borderRadius: radii.md,
+    borderWidth: 1,
+    padding: 12,
+    marginBottom: 14,
+  },
+  head: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  nav: {
+    width: 44,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  title: {
+    fontFamily: fonts.serif,
+    fontSize: 20,
+  },
   row: { flexDirection: 'row' },
-  wd: { flex: 1, textAlign: 'center', color: colors.inkSoft, fontWeight: '700', paddingVertical: 4 },
+  wd: {
+    flex: 1,
+    textAlign: 'center',
+    fontWeight: '700',
+    paddingVertical: 4,
+    fontSize: 12,
+  },
   grid: { flexDirection: 'row', flexWrap: 'wrap' },
   cell: { width: `${100 / 7}%`, aspectRatio: 1, padding: 2 },
-  day: { flex: 1, borderRadius: 999, alignItems: 'center', justifyContent: 'center' },
-  dayText: { color: colors.ink, fontWeight: '700' },
-  legend: { color: colors.inkSoft, fontSize: 12, marginTop: 6, textAlign: 'center' },
-  err: { color: colors.danger, textAlign: 'center', paddingVertical: 20 },
+  day: {
+    flex: 1,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dayText: { fontWeight: '700' },
+  legend: { fontSize: 12, marginTop: 6, textAlign: 'center' },
+  err: { textAlign: 'center', paddingVertical: 20 },
 });

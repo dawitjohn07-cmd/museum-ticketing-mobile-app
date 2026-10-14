@@ -1,19 +1,29 @@
-import { View, Text, StyleSheet, Image, ScrollView, Pressable, Dimensions } from 'react-native';
+import React, { useRef, useState } from 'react';
+import { FlatList, NativeScrollEvent, NativeSyntheticEvent, Pressable, Text, View, useWindowDimensions } from 'react-native';
 import { useRouter } from 'expo-router';
-import { Clock, MapPin, CalendarDays, ChevronRight, ArrowUpRight, Ticket } from 'lucide-react-native';
+import { CalendarDays, ChevronRight, Clock, MapPin, Ticket } from 'lucide-react-native';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from '../../src/lib/i18n/useTranslation';
 import { getMyBookings } from '../../src/lib/api/services';
 import { useAuth } from '../../src/hooks/useAuth';
-import { todayIso } from '../../src/lib/dates';
-import { colors, radii, shadows } from '../../src/theme';
+import { formatDate, todayIso } from '../../src/lib/dates';
+import { BrandHeader, Button, Kicker, Screen } from '../../src/components/ui';
+import { CardArt } from '../../src/components/Art';
+import { useTheme } from '../../src/lib/theme/useTheme';
+import { fonts } from '../../src/theme';
 
-const { width } = Dimensions.get('window');
+const GAP = 12;
 
 export default function VisitorHome() {
   const router = useRouter();
-  const { t } = useTranslation();
+  const { t, locale } = useTranslation();
+  const { colors, isDark } = useTheme();
   const { isAuthenticated } = useAuth();
+  const { width } = useWindowDimensions();
+  const cardW = width - 24 * 2 - 24;
+  const listRef = useRef<FlatList>(null);
+  const [index, setIndex] = useState(0);
+
   const { data: bookings } = useQuery({
     queryKey: ['myBookings', 'home'],
     queryFn: () => getMyBookings({ limit: 100, offset: 0 }),
@@ -24,227 +34,98 @@ export default function VisitorHome() {
     .filter((b) => (b.status === 'pending' || b.status === 'awaiting_payment') && b.visitDate >= todayIso())
     .sort((a, b) => a.visitDate.localeCompare(b.visitDate))[0];
 
+  const onEnd = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    setIndex(Math.max(0, Math.min(2, Math.round(e.nativeEvent.contentOffset.x / (cardW + GAP)))));
+  };
+  const goTo = (i: number) => { listRef.current?.scrollToOffset({ offset: i * (cardW + GAP), animated: true }); setIndex(i); };
+
+  const cardBase = { height: 280, borderRadius: 30, overflow: 'hidden' as const, padding: 20, justifyContent: 'space-between' as const, borderWidth: 1, borderColor: colors.line };
+
+  const cards = [
+    // Card 1: hero
+    <View key="1" style={[cardBase, { width: cardW }]}>
+      <CardArt variant={1} />
+      <Text style={{ color: '#FFF', fontFamily: fonts.serif, fontStyle: 'italic', fontSize: 15, letterSpacing: 1 }}>{t('aau_logo_alt').toUpperCase()}</Text>
+      <View>
+        <Text style={{ color: '#FFF', fontFamily: fonts.serif, fontSize: 38, lineHeight: 42, width: '78%', marginBottom: 16 }}>{t('home_hero_title')}</Text>
+        <Pressable onPress={() => goTo(1)} accessibilityRole="button" hitSlop={10}>
+          <Text style={{ color: '#C6F04F', fontWeight: '800', fontSize: 12, letterSpacing: 2.2 }}>{t('enter_collection')} →</Text>
+        </Pressable>
+      </View>
+    </View>,
+    // Card 2: plan your visit
+    <View key="2" style={[cardBase, { width: cardW, justifyContent: 'flex-start' }]}>
+      <CardArt variant={2} />
+      <Text style={{ color: '#C6F04F', fontWeight: '800', fontSize: 11, letterSpacing: 2, marginBottom: 6 }}>{t('natural_history_addis')}</Text>
+      <Text style={{ color: '#FFF', fontFamily: fonts.serif, fontSize: 36, lineHeight: 40, marginBottom: 10 }}>{t('plan_your_visit')}</Text>
+      <Text style={{ color: 'rgba(255,255,255,0.88)', fontSize: 14, lineHeight: 21, width: '88%' }}>{t('home_visit_description')}</Text>
+      <View style={{ flexDirection: 'row', gap: 10, marginTop: 'auto' }}>
+        <View style={{ flex: 1, backgroundColor: 'rgba(8,10,10,0.55)', borderColor: 'rgba(255,255,255,0.16)', borderWidth: 1, borderRadius: 18, padding: 12 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6 }}><Clock color="#C6F04F" size={14} /><Text style={{ color: '#C6F04F', fontWeight: '800', fontSize: 12 }}>{t('hours')}</Text></View>
+          <Text style={{ color: '#FFF', fontSize: 12, lineHeight: 17, fontWeight: '600' }}>{t('home_hours_value')}</Text>
+          <Text style={{ color: '#FFF', fontSize: 12, lineHeight: 17, fontWeight: '600' }}>{t('sunday_closed')}</Text>
+        </View>
+        <View style={{ flex: 1, backgroundColor: 'rgba(8,10,10,0.55)', borderColor: 'rgba(255,255,255,0.16)', borderWidth: 1, borderRadius: 18, padding: 12 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6 }}><MapPin color="#C6F04F" size={14} /><Text style={{ color: '#C6F04F', fontWeight: '800', fontSize: 12 }}>{t('location')}</Text></View>
+          <Text style={{ color: '#FFF', fontSize: 12, lineHeight: 17, fontWeight: '600' }}>{t('home_location_line1')}</Text>
+          <Text style={{ color: '#FFF', fontSize: 12, lineHeight: 17, fontWeight: '600' }}>{t('home_location_line2')}</Text>
+        </View>
+      </View>
+    </View>,
+    // Card 3: about
+    <View key="3" style={[cardBase, { width: cardW, justifyContent: 'flex-start' }]}>
+      <CardArt variant={3} />
+      <Text style={{ color: '#FFF', fontFamily: fonts.serif, fontSize: 36, lineHeight: 40, marginBottom: 10 }}>{t('about')}</Text>
+      <Text style={{ color: 'rgba(255,255,255,0.88)', fontSize: 15, lineHeight: 24, width: '88%' }}>{t('museum_description')}</Text>
+    </View>,
+  ];
+
   return (
-    <ScrollView style={styles.container} bounces={false} showsVerticalScrollIndicator={false}>
-      <View style={styles.heroContainer}>
-        <Image 
-          source={require('../../assets/images/museum_hero.png')} 
-          style={styles.heroImage}
-          resizeMode="cover"
+    <Screen stickyHeader={<><BrandHeader /><Kicker>ARCHIVE / 001</Kicker></>}>
+      <View style={{ marginHorizontal: -24 }}>
+        <FlatList
+          ref={listRef}
+          data={cards}
+          horizontal
+          keyExtractor={(_, i) => String(i)}
+          renderItem={({ item }) => item}
+          showsHorizontalScrollIndicator={false}
+          snapToInterval={cardW + GAP}
+          decelerationRate="fast"
+          ItemSeparatorComponent={() => <View style={{ width: GAP }} />}
+          contentContainerStyle={{ paddingHorizontal: 24 }}
+          onMomentumScrollEnd={onEnd}
         />
-        <View style={styles.overlay} />
-        <View style={styles.heroEyebrow}><Text style={styles.eyebrowText}>ZNHM · AAU</Text><ArrowUpRight color="#FFF" size={15} /></View>
-        <View style={styles.heroContent}>
-          <Text style={styles.heroTitle}>A living archive of Ethiopia.</Text>
-          <Text style={styles.heroSubtitle}>{t('aau_logo_alt')}</Text>
-        </View>
+      </View>
+      <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 16, marginBottom: 12 }}>
+        {[0, 1, 2].map((i) => (
+          <Pressable key={i} onPress={() => goTo(i)} hitSlop={8} accessibilityLabel={`${i + 1}/3`}>
+            <View style={[
+              { width: 8, height: 8, borderRadius: 4, backgroundColor: isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.18)' },
+              i === index && { width: 26, backgroundColor: colors.lime },
+            ]} />
+          </Pressable>
+        ))}
       </View>
 
-      <View style={styles.content}>
-        <View style={styles.welcomeRow}>
-          <View><Text style={styles.overline}>NATURAL HISTORY · ADDIS ABABA</Text><Text style={styles.welcomeTitle}>{t('plan_your_visit')}</Text></View>
-          <View style={styles.leafMark}><Text style={styles.leafMarkText}>✦</Text></View>
-        </View>
-        <View style={styles.infoCards}>
-          <View style={styles.infoCard}>
-            <Clock color="#2E7D32" size={24} />
-            <Text style={styles.infoCardTitle}>{t('hours')}</Text>
-            <Text style={styles.infoCardText}>{t('monday_saturday')}</Text>
-            <Text style={styles.infoCardSubtext}>8:30 AM - 5:00 PM</Text>
-            <Text style={styles.closedText}>{t('sunday_closed')}</Text>
+      {upcoming && (
+        <Pressable
+          style={({ pressed }) => [{ flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: colors.card, borderColor: colors.line, borderWidth: 1, borderRadius: 22, padding: 14, marginTop: 6, marginBottom: 4 }, pressed && { opacity: 0.85 }]}
+          onPress={() => router.push(`/(visitor)/booking/${upcoming.id}`)}
+        >
+          <View style={{ width: 42, height: 42, borderRadius: 21, backgroundColor: colors.limeSoft, alignItems: 'center', justifyContent: 'center' }}>
+            <Ticket color={colors.lime} size={20} />
           </View>
-          
-          <View style={styles.infoCard}>
-            <MapPin color="#2E7D32" size={24} />
-            <Text style={styles.infoCardTitle}>{t('location')}</Text>
-            <Text style={styles.infoCardText}>AAU Arat Kilo Campus</Text>
-            <Text style={styles.infoCardSubtext}>Science Faculty</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: colors.lime, fontWeight: '800', fontSize: 11, letterSpacing: 1.6, textTransform: 'uppercase' }}>{t('upcoming_booking')}</Text>
+            <Text style={{ color: colors.text, fontFamily: fonts.serif, fontSize: 18, marginTop: 2 }}>{formatDate(upcoming.visitDate, locale)}</Text>
           </View>
-        </View>
+          <ChevronRight color={colors.lime} size={22} />
+        </Pressable>
+      )}
 
-        {upcoming && (
-          <Pressable style={({ pressed }) => [styles.upcomingCard, pressed && styles.pressed]} onPress={() => router.push(`/(visitor)/booking/${upcoming.id}`)}>
-            <View style={styles.upcomingIcon}><Ticket color={colors.cream} size={21} /></View>
-            <View style={styles.upcomingCopy}><Text style={styles.upcomingLabel}>{t('upcoming_booking')}</Text><Text style={styles.upcomingDate}>{upcoming.visitDate}</Text></View>
-            <ChevronRight color={colors.moss} size={22} />
-          </Pressable>
-        )}
-        <View style={styles.actionSection}>
-          <Text style={styles.sectionTitle}>{t('plan_your_visit')}</Text>
-          <Text style={styles.sectionBody}>
-            {t('home_visit_description')}
-          </Text>
-          
-          <Pressable 
-            style={({ pressed }) => [
-              styles.bookButton,
-              pressed && styles.pressed
-            ]}
-            onPress={() => router.push('/(visitor)/book')}
-          >
-            <CalendarDays color="#FFF" size={20} />
-            <Text style={styles.bookButtonText}>{t('book_now')}</Text>
-            <ChevronRight color="#FFF" size={20} style={styles.buttonIconRight} />
-          </Pressable>
-          <Pressable
-            style={({ pressed }) => [styles.bookButton, { backgroundColor: colors.gold, marginTop: 12 }, pressed && styles.pressed]}
-            onPress={() => router.push('/(visitor)/group' as never)}
-          >
-            <Ticket color="#FFF" size={20} />
-            <Text style={styles.bookButtonText}>{t('book_for_school_institution')}</Text>
-            <ChevronRight color="#FFF" size={20} style={styles.buttonIconRight} />
-          </Pressable>
-        </View>
-        
-        <View style={styles.aboutSection}>
-          <Text style={styles.sectionTitle}>{t('about')}</Text>
-          <Text style={styles.sectionBody}>
-            {t('museum_description')}
-          </Text>
-        </View>
-      </View>
-    </ScrollView>
+      <Button label={t('book_now')} icon={<CalendarDays color={colors.limeDark} size={20} />} onPress={() => router.push('/(visitor)/book')} />
+      <Button label={t('book_for_school_institution')} variant="rust" icon={<Ticket color="#FFF" size={20} />} onPress={() => router.push('/(visitor)/group' as never)} />
+    </Screen>
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: colors.cream,
-  },
-  heroContainer: {
-    width: width,
-    height: 360,
-    position: 'relative',
-  },
-  heroImage: {
-    width: '100%',
-    height: '100%',
-  },
-  overlay: {
-    ...StyleSheet.absoluteFill as any,
-    backgroundColor: 'rgba(8, 35, 24, 0.48)',
-  },
-  heroContent: {
-    position: 'absolute',
-    bottom: 38,
-    left: 20,
-    right: 20,
-  },
-  heroEyebrow: { position: 'absolute', top: 28, left: 22, flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 12, paddingVertical: 7, borderRadius: radii.pill, backgroundColor: 'rgba(255,255,255,0.16)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.28)' },
-  eyebrowText: { color: '#FFF', fontSize: 11, fontWeight: '800', letterSpacing: 1.5 },
-  heroTitle: {
-    fontSize: 38,
-    fontWeight: '800',
-    color: '#FFF',
-    marginBottom: 8,
-    lineHeight: 34,
-  },
-  heroSubtitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#D6E9D4',
-    textTransform: 'uppercase',
-    letterSpacing: 1,
-  },
-  content: {
-    padding: 22,
-    marginTop: -28,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    backgroundColor: colors.cream,
-  },
-  welcomeRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 22 },
-  overline: { color: colors.forestBright, fontSize: 10, fontWeight: '900', letterSpacing: 1.4, marginBottom: 5 },
-  welcomeTitle: { color: colors.ink, fontSize: 25, fontWeight: '900' },
-  leafMark: { width: 46, height: 46, borderRadius: 23, backgroundColor: colors.moss, alignItems: 'center', justifyContent: 'center' },
-  leafMarkText: { color: colors.forest, fontSize: 24 },
-  infoCards: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 22,
-  },
-  infoCard: {
-    backgroundColor: colors.paper,
-    borderRadius: radii.md,
-    padding: 17,
-    width: '48%',
-    alignItems: 'center',
-    ...shadows.card,
-  },
-  infoCardTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: colors.ink,
-    marginTop: 12,
-    marginBottom: 4,
-  },
-  infoCardText: {
-    fontSize: 13,
-    color: colors.inkSoft,
-    textAlign: 'center',
-  },
-  infoCardSubtext: {
-    fontSize: 12,
-    color: colors.inkSoft,
-    textAlign: 'center',
-    marginTop: 2,
-  },
-  closedText: {
-    fontSize: 12,
-    color: colors.danger,
-    fontWeight: '600',
-    marginTop: 6,
-  },
-  actionSection: {
-    backgroundColor: colors.paper,
-    borderRadius: radii.lg,
-    padding: 24,
-    marginBottom: 30,
-    ...shadows.card,
-  },
-  sectionTitle: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: colors.ink,
-    marginBottom: 12,
-  },
-  sectionBody: {
-    fontSize: 15,
-    lineHeight: 24,
-    color: colors.inkSoft,
-    marginBottom: 20,
-  },
-  bookButton: {
-    backgroundColor: colors.forest,
-    borderRadius: radii.md,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
-  },
-  pressed: {
-    opacity: 0.82,
-    transform: [{ scale: 0.98 }],
-  },
-  bookButtonText: {
-    color: colors.cream,
-    fontSize: 16,
-    fontWeight: '700',
-    marginLeft: 12,
-    flex: 1,
-  },
-  buttonIconRight: {
-    marginLeft: 'auto',
-  },
-  aboutSection: {
-    padding: 10,
-    paddingBottom: 40,
-  },
-  upcomingCard: { flexDirection: 'row', alignItems: 'center', padding: 16, marginBottom: 22, borderRadius: radii.md, backgroundColor: colors.forest, ...shadows.floating },
-  upcomingIcon: { width: 42, height: 42, borderRadius: 14, backgroundColor: colors.forestBright, alignItems: 'center', justifyContent: 'center', marginRight: 13 },
-  upcomingCopy: { flex: 1 },
-  upcomingLabel: { color: colors.moss, fontSize: 11, fontWeight: '900', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 },
-  upcomingDate: { color: '#FFF', fontSize: 16, fontWeight: '800' },
-});
