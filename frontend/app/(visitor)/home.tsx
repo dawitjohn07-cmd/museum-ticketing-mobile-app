@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { FlatList, NativeScrollEvent, NativeSyntheticEvent, Pressable, Text, View, useWindowDimensions } from 'react-native';
 import { useRouter } from 'expo-router';
 import { CalendarDays, ChevronRight, Clock, MapPin, Ticket } from 'lucide-react-native';
@@ -23,6 +23,21 @@ export default function VisitorHome() {
   const cardW = width - 24 * 2 - 24;
   const listRef = useRef<FlatList>(null);
   const [index, setIndex] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setIndex((current) => {
+        const next = (current + 1) % 3;
+        listRef.current?.scrollToOffset({
+          offset: next * (cardW + GAP),
+          animated: true,
+        });
+        return next;
+      });
+    }, 4500);
+
+    return () => clearInterval(timer);
+  }, [cardW]);
 
   const { data: bookings } = useQuery({
     queryKey: ['myBookings', 'home'],

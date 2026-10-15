@@ -144,6 +144,10 @@ function normalizePath(path: string) {
   return search ? `${p}?${search}` : p;
 }
 
+export function getApiBaseUrl() {
+  return API_BASE;
+}
+
 async function request<T>(path: string, options: RequestInit = {}, isRetry = false, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
   const normalized = normalizePath(path);
   const headers: Record<string, string> = {

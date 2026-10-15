@@ -90,10 +90,12 @@ const s = StyleSheet.create({
   },
   header: {
     paddingTop: 4,
+    paddingBottom: 16,
   },
   formArea: {
     flex: 1,
-    justifyContent: 'center',
+    justifyContent: 'flex-start',
+    paddingTop: 8,
     paddingBottom: 24,
   },
   title: {

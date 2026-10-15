@@ -2,13 +2,15 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, AppState, Platform, StyleSheet, Text, View } from 'react-native';
 import * as WebBrowser from 'expo-web-browser';
 import * as Linking from 'expo-linking';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   cancelBooking, getBooking, getCategories, getMyRefunds, requestPartialRefund, rescheduleBooking, updateBooking, verifyBookingPayment,
   type Booking,
 } from '../../../src/lib/api/services';
-import { ApiError, getApiErrorMessageForDisplay } from '../../../src/lib/api/client';
+import { ApiError, getAccessToken, getApiBaseUrl, getApiErrorMessageForDisplay, refreshAccessToken } from '../../../src/lib/api/client';
 import { useRequireAuth } from '../../../src/hooks/useAuth';
 import { useTranslation } from '../../../src/lib/i18n/useTranslation';
 import { useTheme } from '../../../src/lib/theme/useTheme';
@@ -41,6 +43,7 @@ export default function BookingDetailScreen() {
   const [newDate, setNewDate] = useState('');
   const [editDate, setEditDate] = useState('');
   const [editQty, setEditQty] = useState<Record<string, number>>({});
+  const [downloadingReceipt, setDownloadingReceipt] = useState(false);
   const polling = useRef(false);
 
   const q = useQuery({ queryKey: ['booking', id], queryFn: () => getBooking(id!), enabled: !!id && isAuthenticated });
@@ -106,7 +109,47 @@ export default function BookingDetailScreen() {
     void pollPayment();
   };
   const openReceipt = async () => {
-    if (booking?.receiptUrl) await WebBrowser.openBrowserAsync(booking.receiptUrl);
+    if (!booking?.receiptUrl || downloadingReceipt) return;
+
+    if (Platform.OS === 'web') {
+      await WebBrowser.openBrowserAsync(booking.receiptUrl);
+      return;
+    }
+
+    setDownloadingReceipt(true);
+    try {
+      const download = async (token: string | null) =>
+        FileSystem.downloadAsync(
+          `${getApiBaseUrl()}/bookings/${booking.id}/receipt/download/`,
+          `${FileSystem.cacheDirectory}receipt-${booking.reference}.pdf`,
+          {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+          },
+        );
+
+      let result = await download(await getAccessToken());
+      if (result.status === 401) {
+        const freshToken = await refreshAccessToken();
+        if (freshToken) result = await download(freshToken);
+      }
+      if (result.status < 200 || result.status >= 300) {
+        throw new Error(`Receipt download failed (HTTP ${result.status}).`);
+      }
+
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(result.uri, {
+          mimeType: 'application/pdf',
+          dialogTitle: t('download_receipt'),
+          UTI: 'com.adobe.pdf',
+        });
+      } else {
+        await WebBrowser.openBrowserAsync(result.uri);
+      }
+    } catch (e) {
+      fail(e);
+    } finally {
+      setDownloadingReceipt(false);
+    }
   };
 
   const cancel = useMutation({
@@ -182,7 +225,7 @@ export default function BookingDetailScreen() {
         <Row k={t('total')} v={`ETB ${booking.totalAmountEtb}`} strong />
         {booking.attendedQuantity !== null && booking.attendedQuantity !== undefined ? <Row k={t('attended')} v={String(booking.attendedQuantity)} /> : null}
         <Row k={t('booked_on')} v={formatDateTime(booking.createdAt, locale)} />
-        {showReceipt ? <Button label={t('download_receipt')} variant="secondary" onPress={openReceipt} /> : null}
+        {showReceipt ? <Button label={downloadingReceipt ? t('processing') : t('download_receipt')} variant="secondary" onPress={openReceipt} disabled={downloadingReceipt} /> : null}
       </Card>
 
       {isAwaiting && (
