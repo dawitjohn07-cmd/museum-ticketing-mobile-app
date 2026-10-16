@@ -1,5 +1,5 @@
 import React from 'react';
-import { ActivityIndicator, Modal, Pressable, ScrollView, StyleProp, StyleSheet, Text, TextInput, TextInputProps, TextStyle, View, ViewStyle } from 'react-native';
+import { ActivityIndicator, Image, Modal, Pressable, ScrollView, StyleProp, StyleSheet, Text, TextInput, TextInputProps, TextStyle, View, ViewStyle } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { Defs, RadialGradient, Rect, Stop } from 'react-native-svg';
 import { ArrowLeft } from 'lucide-react-native';
@@ -89,9 +89,12 @@ export function BrandHeader({ onBack }: { onBack?: () => void }) {
         </Pressable>
       ) : (
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-          <View style={{ width: 22, height: 22, borderRadius: 11, borderWidth: 2, borderColor: colors.lime, alignItems: 'center', justifyContent: 'center' }}>
-            <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: colors.lime }} />
-          </View>
+          <Image
+            source={require('../../assets/expo.icon/Assets/Addis_Ababa_University_logo.png')}
+            accessibilityLabel="Addis Ababa University logo"
+            resizeMode="contain"
+            style={{ width: 32, height: 32 }}
+          />
           <Text style={{ color: colors.text, fontWeight: '800', fontSize: 16, letterSpacing: 0.6 }}>ZNHM–AAU</Text>
         </View>
       )}
